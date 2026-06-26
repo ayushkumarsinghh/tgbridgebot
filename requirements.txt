@@ -1,0 +1,7 @@
+discord.py==2.3.2
+telethon
+tls-client
+qrcode
+pillow
+undetected-chromedriver==3.5.5
+selenium==4.15.2

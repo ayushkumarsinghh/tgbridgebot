@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+sparky.db
+tg_states.json
+bot_session.session
+bridge_session*.session
+qrs/

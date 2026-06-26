@@ -1,0 +1,24 @@
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Python cache and compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local database and state files
+sparky.db
+tg_states.json
+
+# Telegram sessions
+bot_session.session
+bridge_session*.session
+
+# Local environment variables
+.env
+
+# Temporary QR files
+qrs/
