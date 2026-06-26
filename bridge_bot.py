@@ -242,14 +242,11 @@ def create_headless_driver(proxy=None):
     
     # Helper to clear cached chromedrivers in AppData to fix file conflicts (WinError 183)
     def clear_uc_cache():
-        # Force terminate any zombie chromedriver or chrome processes holding file locks
+        # Force terminate any zombie chromedriver or chrome processes holding file locks (Windows only)
         try:
             if os.name == 'nt':
                 os.system("taskkill /f /im chromedriver.exe >nul 2>&1")
                 os.system("taskkill /f /im chrome.exe >nul 2>&1")
-            else:
-                os.system("pkill -9 -f chromedriver >/dev/null 2>&1")
-                os.system("pkill -9 -f chrome >/dev/null 2>&1")
         except Exception:
             pass
             
