@@ -87,6 +87,16 @@ _original_connect = sqlite3.connect
 def custom_connect(database, *args, **kwargs):
     if database == "sparky.db":
         database = os.getenv("DATABASE_PATH", "sparky.db")
+    
+    # Automatically create parent directories if they don't exist yet
+    parent_dir = os.path.dirname(database)
+    if parent_dir and not os.path.exists(parent_dir):
+        try:
+            os.makedirs(parent_dir, exist_ok=True)
+            print(f"[System] Created database directory: {parent_dir}")
+        except Exception as e:
+            print(f"[Error] Failed to create database directory {parent_dir}: {e}")
+            
     return _original_connect(database, *args, **kwargs)
 sqlite3.connect = custom_connect
 
@@ -109,6 +119,13 @@ def load_states():
 
 def save_states(states):
     try:
+        # Automatically create parent directories if they don't exist yet
+        parent_dir = os.path.dirname(STATES_FILE)
+        if parent_dir and not os.path.exists(parent_dir):
+            try:
+                os.makedirs(parent_dir, exist_ok=True)
+            except Exception as e:
+                print(f"[Warning] Failed to create states directory {parent_dir}: {e}")
         with open(STATES_FILE, "w") as f:
             json.dump({str(k): v for k, v in states.items()}, f, indent=4)
     except Exception as e:
