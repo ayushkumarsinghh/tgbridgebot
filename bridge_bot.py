@@ -669,8 +669,8 @@ async def handle_panel_claim(interaction: discord.Interaction, panel_id: int):
             f"**Instructions**:\n"
             f"1. Open each Stripe payment link below or scan the QRs to complete the payments.\n"
             f"2. Once payment is completed, click **Scanned** below each QR code to verify it.\n\n"
-            f"⚠️ **Warning**: You have 2 minutes to complete this job. If you go offline or exceed 2 minutes, 20 coins will be deducted.\n"
-            f"🚫 **Strict Warning**: If you click **Scanned** on a QR that is NOT scanned or completed, **35 coins will be deducted** from your balance."
+            f"**Warning**: You have 2 minutes to complete this job. If you go offline or exceed 2 minutes, 20 coins will be deducted.\n"
+            f"**Strict Warning**: If you click **Scanned** on a QR that is NOT scanned or completed, **35 coins will be deducted** from your balance."
         ),
         color=discord.Color.purple()
     )
