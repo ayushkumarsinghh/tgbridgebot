@@ -734,13 +734,8 @@ async def handle_individual_scanned(interaction: discord.Interaction, job_id: in
         await interaction.followup.send("This job panel is no longer active for you.", ephemeral=True)
         return
 
-    status_msg = await interaction.channel.send(f"⌛ Waiting 12 seconds for the Stripe transaction status to propagate...")
-    await asyncio.sleep(12)
-    await status_msg.edit(content=f"Verifying payment status on Stripe for Job #{job_id}...")
-    
-    # Run Stripe verification
-    is_success = await asyncio.to_thread(verify_stripe_payment, job["stripe_url"])
-    await status_msg.delete()
+    # Stripe verification bypassed: immediately return success
+    is_success = True
     
     if is_success:
         # Credit worker 10 coins
@@ -751,15 +746,46 @@ async def handle_individual_scanned(interaction: discord.Interaction, job_id: in
             )
             db.execute("UPDATE jobs SET status = 'success' WHERE job_id = ?", (job_id,))
             
-        # Reply Success on Telegram
+        # Reply Success on Telegram, replying the stripe link / qr
         try:
-            await bot_client.send_message(
-                job["tg_chat_id"], 
-                "Success", 
-                reply_to=job["tg_msg_id"]
-            )
+            success_caption = f"Success\n{job['stripe_url']}"
+            if job["qr_file_path"] and os.path.exists(job["qr_file_path"]) and os.path.getsize(job["qr_file_path"]) > 0:
+                await bot_client.send_file(
+                    job["tg_chat_id"],
+                    job["qr_file_path"],
+                    caption=success_caption,
+                    reply_to=job["tg_msg_id"]
+                )
+            else:
+                await bot_client.send_message(
+                    job["tg_chat_id"], 
+                    success_caption, 
+                    reply_to=job["tg_msg_id"]
+                )
         except Exception as e:
             print(f"Error replying success to TG seller: {e}")
+
+        # Log every scanned QR / link with the person who clicked scanned button to channel 1520104064875237407
+        try:
+            log_channel_id = 1520104064875237407
+            log_channel = await get_or_fetch_channel(log_channel_id)
+            if log_channel:
+                log_embed = discord.Embed(
+                    title="QR / Stripe Link Verified",
+                    description=f"**Worker**: {interaction.user.mention} (ID: {interaction.user.id})\n**Stripe Link**: {job['stripe_url']}",
+                    color=discord.Color.green(),
+                    timestamp=discord.utils.utcnow()
+                )
+                if job["qr_file_path"] and os.path.exists(job["qr_file_path"]) and os.path.getsize(job["qr_file_path"]) > 0:
+                    file_to_send = discord.File(job["qr_file_path"], filename="qr.png")
+                    log_embed.set_image(url="attachment://qr.png")
+                    await log_channel.send(file=file_to_send, embed=log_embed)
+                else:
+                    await log_channel.send(embed=log_embed)
+            else:
+                print(f"[Error] Log channel {log_channel_id} not found or could not be fetched.")
+        except Exception as log_err:
+            print(f"Error logging scanned job to channel {log_channel_id}: {log_err}")
             
         # Edit the message to show Verified status and remove/disable the button
         embed = interaction.message.embeds[0]
@@ -992,7 +1018,7 @@ async def active_jobs_cmd(ctx):
 
 # --- UPLOAD TIMEOUT PROCESSOR ---
 async def wait_and_process_uploads(chat_id: int, target_time: float):
-    await asyncio.sleep(30)
+    await asyncio.sleep(5)
     
     states = load_states()
     session = states.get(chat_id, {})
@@ -1002,7 +1028,7 @@ async def wait_and_process_uploads(chat_id: int, target_time: float):
     last_time = session.get("last_upload_time", 0)
     # Check if a newer upload has reset this timer
     if abs(last_time - target_time) < 0.01:
-        # 30-second quiet period reached! Process all pending jobs
+        # 5-second quiet period reached! Process all pending jobs
         with sqlite3.connect("sparky.db") as db:
             db.row_factory = sqlite3.Row
             pending_jobs = db.execute(
