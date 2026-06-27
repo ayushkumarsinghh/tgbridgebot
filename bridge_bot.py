@@ -1429,7 +1429,7 @@ async def tg_message_handler(event):
         
         target_address = "0xE9d2b69488DcFa424B535f765761b2da6ddE328f"
         payment_msg = (
-            f"Please send exactly **${total:.2f} USDT** on this address: `USDT - {target_address}`\n\n"
+            f"Please send exactly **${total:.2f} USDT** on this address: USDT - `{target_address}`\n\n"
             f"Once the transaction is sent, please drop your Transaction Hash (TXID) below to verify."
         )
         await event.reply(payment_msg)
@@ -1507,7 +1507,7 @@ async def tg_message_handler(event):
         else:
             await event.reply(
                 f"❌ **Verification Failed!**\n"
-                f"Could not find a confirmed USDT transfer of **${total:.2f}** to `USDT - {target_address}` in this transaction on either the BSC (BEP20) or Polygon network.\n\n"
+                f"Could not find a confirmed USDT transfer of **${total:.2f}** to USDT - `{target_address}` in this transaction on either the BSC (BEP20) or Polygon network.\n\n"
                 f"Please verify that the transaction is fully confirmed on the blockchain and you sent the correct amount, then reply with the correct TXID again."
             )
         
