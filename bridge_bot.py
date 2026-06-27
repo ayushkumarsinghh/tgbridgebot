@@ -111,6 +111,7 @@ STATE_AWAITING_APPROVAL = "STATE_AWAITING_APPROVAL"
 STATE_AWAITING_TXID = "STATE_AWAITING_TXID"
 STATE_AWAITING_TOKEN = "STATE_AWAITING_TOKEN"
 STATE_AWAITING_DEPOSIT_AMOUNT = "STATE_AWAITING_DEPOSIT_AMOUNT"
+tg_service_active = True
 
 def load_states():
     if os.path.exists(STATES_FILE):
@@ -214,7 +215,8 @@ def init_db():
         """)
 
 # Initialize Clients
-bot_client = TelegramClient("bot_session", TELEGRAM_API_ID, TELEGRAM_API_HASH)
+SESSION_PATH = os.getenv("SESSION_FILE_PATH", "bot_session")
+bot_client = TelegramClient(SESSION_PATH, TELEGRAM_API_ID, TELEGRAM_API_HASH)
 
 intents = discord.Intents.default()
 intents.members = True
@@ -1246,6 +1248,24 @@ async def listusers_cmd(ctx):
         msg_lines.append(f"• <@{row['user_id']}> (ID: {row['user_id']})")
     await ctx.send("\n".join(msg_lines))
 
+@discord_bot.command(name="tgstop")
+async def tgstop_cmd(ctx):
+    if ctx.author.id != OWNER_ID:
+        await ctx.send("❌ Only the bot owner can run this command.")
+        return
+    global tg_service_active
+    tg_service_active = False
+    await ctx.send("✅ Telegram bot services have been **paused**.")
+
+@discord_bot.command(name="tgstart")
+async def tgstart_cmd(ctx):
+    if ctx.author.id != OWNER_ID:
+        await ctx.send("❌ Only the bot owner can run this command.")
+        return
+    global tg_service_active
+    tg_service_active = True
+    await ctx.send("✅ Telegram bot services have been **resumed**.")
+
 @discord_bot.command(name="jobs", aliases=["active"])
 async def active_jobs_cmd(ctx):
     if not is_admin_user(ctx.author.id, ctx.author.guild_permissions):
@@ -1352,6 +1372,13 @@ async def wait_and_process_uploads(chat_id: int, target_time: float):
 # --- TELEGRAM BOT EVENT HANDLERS ---
 @bot_client.on(events.NewMessage(pattern="/start"))
 async def tg_start_handler(event):
+    if not tg_service_active:
+        sender = await event.get_sender()
+        username = sender.username or ""
+        if username.lower() != "sleepu69":
+            await event.reply("⚠️ Bot services are currently paused by the administrator.")
+            return
+
     briefing_msg = (
         "👋 **Welcome to the Bot!** Here is a list of available commands:\n\n"
         "💸 `/deposit` - Request a new deposit (USDT BEP20 / Polygon)\n"
@@ -1363,6 +1390,13 @@ async def tg_start_handler(event):
 
 @bot_client.on(events.NewMessage(pattern="/deposit"))
 async def tg_deposit_handler(event):
+    if not tg_service_active:
+        sender = await event.get_sender()
+        username = sender.username or ""
+        if username.lower() != "sleepu69":
+            await event.reply("⚠️ Bot services are currently paused by the administrator.")
+            return
+
     chat_id = event.chat_id
     states = load_states()
     states[chat_id] = {"state": STATE_AWAITING_DEPOSIT_AMOUNT}
@@ -1372,10 +1406,24 @@ async def tg_deposit_handler(event):
 
 @bot_client.on(events.NewMessage(pattern="/support"))
 async def tg_support_handler(event):
+    if not tg_service_active:
+        sender = await event.get_sender()
+        username = sender.username or ""
+        if username.lower() != "sleepu69":
+            await event.reply("⚠️ Bot services are currently paused by the administrator.")
+            return
+
     await event.reply("For support, please contact the owner: @SLEEPU69")
 
 @bot_client.on(events.NewMessage(pattern="/balance"))
 async def tg_balance_handler(event):
+    if not tg_service_active:
+        sender = await event.get_sender()
+        username = sender.username or ""
+        if username.lower() != "sleepu69":
+            await event.reply("⚠️ Bot services are currently paused by the administrator.")
+            return
+
     chat_id = event.chat_id
     with sqlite3.connect("sparky.db") as db:
         db.row_factory = sqlite3.Row
@@ -1384,8 +1432,37 @@ async def tg_balance_handler(event):
     bal = row["balance"] if row else 0.0
     await event.reply(f"Your current balance is: ${bal:.2f}")
 
+@bot_client.on(events.NewMessage(pattern=r"^/tgstop$"))
+async def tg_service_stop_handler(event):
+    sender = await event.get_sender()
+    username = sender.username or ""
+    if username.lower() != "sleepu69":
+        return
+        
+    global tg_service_active
+    tg_service_active = False
+    await event.reply("✅ Telegram bot services have been **paused**.")
+
+@bot_client.on(events.NewMessage(pattern=r"^/tgstart$"))
+async def tg_service_start_handler(event):
+    sender = await event.get_sender()
+    username = sender.username or ""
+    if username.lower() != "sleepu69":
+        return
+        
+    global tg_service_active
+    tg_service_active = True
+    await event.reply("✅ Telegram bot services have been **resumed**.")
+
 @bot_client.on(events.NewMessage(pattern="/startqr"))
 async def tg_start_qr_handler(event):
+    if not tg_service_active:
+        sender = await event.get_sender()
+        username = sender.username or ""
+        if username.lower() != "sleepu69":
+            await event.reply("⚠️ Bot services are currently paused by the administrator.")
+            return
+
     chat_id = event.chat_id
     with sqlite3.connect("sparky.db") as db:
         db.row_factory = sqlite3.Row
@@ -1407,6 +1484,13 @@ async def tg_message_handler(event):
     # Ignore commands (handled separately)
     if event.message.text and event.message.text.startswith("/"):
         return
+        
+    if not tg_service_active:
+        sender = await event.get_sender()
+        username = sender.username or ""
+        if username.lower() != "sleepu69":
+            await event.reply("⚠️ Bot services are currently paused by the administrator.")
+            return
         
     chat_id = event.chat_id
     states = load_states()
