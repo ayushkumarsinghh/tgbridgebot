@@ -1455,9 +1455,8 @@ async def tg_message_handler(event):
         save_states(states)
         
         instruction_msg = (
-            f"Please send exactly **${total:.2f} USDT** on the **{chain_name}** network to the address:\n\n"
-            f"`USDT - {target_address}`\n\n"
-            f"**Important**: Send exactly the requested amount. Once the transaction is sent, reply to this message with your Transaction Hash (TXID/TX Hash) to verify."
+            f"Please send exactly **${total:.2f} USDT** on this address: `USDT - {target_address}`\n\n"
+            f"Once the transaction is sent, please drop your Transaction Hash (TXID) below to verify."
         )
         await event.reply(instruction_msg)
 
