@@ -318,39 +318,81 @@ def create_headless_driver(proxy=None):
 
 
 def verify_stripe_payment(url: str) -> bool:
-    # 1. Fast Path: try using tls_client (very fast, uses low memory)
+    import base64
+    import urllib.parse
+    import urllib.request
+    import json
+    
+    # 1. First extract client_secret and publishable_key from the instruction page HTML
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    
+    # We use tls_client to fetch the page so we bypass any simple TLS blocking
     session = tls_client.Session(client_identifier="chrome_120", random_tls_extension_order=True)
     proxy = get_proxy_url()
     if proxy:
         session.proxies = {"http": proxy, "https": proxy}
+        
     try:
-        r = session.get(url, timeout_seconds=10)
-        if r.status_code == 200 and "Action Successful" in r.text:
-            print(f"[System] Stripe verified via tls_client for {url}")
-            return True
-    except Exception as e:
-        print(f"tls_client verification check failed/errored: {e}")
-
-    # 2. Slow Path Fallback: use headless undetected-chromedriver (renders JS, handles Cloudflare)
-    print(f"[System] tls_client did not verify. Falling back to headless Chrome for {url}...")
-    driver = None
-    try:
-        driver = create_headless_driver(proxy)
-        driver.get(url)
-        # Wait up to 6 seconds for client-side JS rendering
-        time.sleep(6)
-        if "Action Successful" in driver.page_source:
-            print(f"[System] Stripe verified via headless Chrome for {url}")
-            return True
-    except Exception as e:
-        print(f"Headless Chrome verification check failed/errored: {e}")
-    finally:
-        if driver:
-            try:
-                driver.quit()
-            except:
-                pass
-                
+        print(f"[Stripe Query] Fetching Stripe instructions page: {url}")
+        r = session.get(url, headers=headers, timeout_seconds=10)
+        if r.status_code != 200:
+            print(f"[-] Stripe verification page request failed with status code {r.status_code}")
+            return False
+            
+        html = r.text
+        match = re.search(r'data-message="([^"]+)"', html)
+        if not match:
+            print("[-] data-message attribute not found in HTML.")
+            # Fallback check
+            if "Action Successful" in html:
+                print("[+] Stripe page explicitly has 'Action Successful' in static text.")
+                return True
+            return False
+            
+        decoded = base64.b64decode(match.group(1)).decode("utf-8")
+        payload = json.loads(decoded)
+        
+        client_secret = payload.get("client_secret")
+        publishable_key = payload.get("publishable_key")
+        
+        if not client_secret or not publishable_key:
+            print("[-] Missing client_secret or publishable_key in payload.")
+            return False
+            
+        # Extract intent ID
+        intent_id = client_secret.split("_secret_")[0]
+        
+        # Build Stripe API query URL
+        if client_secret.startswith("seti_"):
+            api_url = f"https://api.stripe.com/v1/setup_intents/{intent_id}"
+        elif client_secret.startswith("pi_"):
+            api_url = f"https://api.stripe.com/v1/payment_intents/{intent_id}"
+        else:
+            print(f"[-] Unknown intent type prefix: {client_secret}")
+            return False
+            
+        params = {
+            "key": publishable_key,
+            "client_secret": client_secret,
+            "is_stripe_sdk": "true"
+        }
+        api_url = f"{api_url}?{urllib.parse.urlencode(params)}"
+        print(f"[Stripe Query] Querying public API endpoint: {api_url}")
+        
+        api_res = session.get(api_url, headers=headers, timeout_seconds=10)
+        if api_res.status_code == 200:
+            res_data = api_res.json()
+            status = res_data.get("status")
+            print(f"[Stripe Query] Intent status for {url}: {status}")
+            return status == "succeeded"
+        else:
+            print(f"[-] Stripe API query returned status code {api_res.status_code}")
+            
+    except Exception as err:
+        print(f"[-] Error verifying stripe payment status: {err}")
+        
     return False
 
 # --- DISCORD APPROVAL VIEW ---
@@ -735,8 +777,13 @@ async def handle_individual_scanned(interaction: discord.Interaction, job_id: in
         await interaction.followup.send("This job panel is no longer active for you.", ephemeral=True)
         return
 
-    # Stripe verification bypassed: immediately return success
-    is_success = True
+    # Check Stripe verification using the public API endpoint query
+    status_msg = await interaction.channel.send(f"⌛ Checking Stripe transaction status for Job #{job_id}...")
+    is_success = await asyncio.to_thread(verify_stripe_payment, job["stripe_url"])
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
     
     if is_success:
         # Credit worker 10 coins
@@ -840,7 +887,7 @@ async def handle_individual_scanned(interaction: discord.Interaction, job_id: in
                     except:
                         pass
     else:
-        await interaction.channel.send(f"❌ **Verification failed for Job #{job_id}.** The link did not show 'Action Successful'. Please ensure you paid before clicking Scanned.")
+        await interaction.channel.send(f"❌ **Verification failed for Job #{job_id}.** Stripe payment is not completed/succeeded yet. Please ensure you completed payment before clicking Scanned.")
 
 async def handle_panel_cancel(interaction: discord.Interaction, panel_id: int):
     await interaction.response.defer()
