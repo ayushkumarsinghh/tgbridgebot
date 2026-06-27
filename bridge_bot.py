@@ -1430,51 +1430,36 @@ async def tg_message_handler(event):
         payment_msg = (
             f"Total Amount: ${total:.2f} ({count} QRs * $0.50 each)\n\n"
             f"Please select your payment method:\n"
-            f"1. Binance ID (Admin Manual Verification)\n"
-            f"2. USDT - BEP20 / BSC (Instant Blockchain Verification)\n"
-            f"3. USDT - Polygon (Instant Blockchain Verification)\n\n"
-            f"Please reply with the number of your choice (1, 2, or 3)."
+            f"1. USDT - BEP20 / BSC (Instant Blockchain Verification)\n"
+            f"2. USDT - Polygon (Instant Blockchain Verification)\n\n"
+            f"Please reply with the number of your choice (1 or 2)."
         )
         await event.reply(payment_msg)
 
     elif state == STATE_AWAITING_PAYMENT_METHOD:
         text = (event.message.text or "").strip()
-        if text not in ["1", "2", "3"]:
-            await event.reply("Please select a valid option by replying with 1, 2, or 3.")
+        if text not in ["1", "2"]:
+            await event.reply("Please select a valid option by replying with 1 or 2.")
             return
             
         total = session.get("total", 0.50)
         
-        if text == "1":
-            # Binance ID path (manual confirmation)
-            session["state"] = STATE_AWAITING_CONFIRMATION
-            states[chat_id] = session
-            save_states(states)
-            
-            payment_msg = (
-                f"Please pay **${total:.2f}** using Binance ID:\n"
-                f"`{BINANCE_ID}`\n\n"
-                f"Once you have completed the transfer, please reply with 'Confirm' or 'Sent' to submit it for approval."
-            )
-            await event.reply(payment_msg)
-            
-        else:
-            # Blockchain path (BEP20 or Polygon)
-            chain = "bsc" if text == "2" else "polygon"
-            chain_name = "BEP20 (Binance Smart Chain)" if chain == "bsc" else "Polygon"
-            target_address = BSC_WALLET_ADDRESS if chain == "bsc" else POLYGON_WALLET_ADDRESS
-            
-            session["state"] = STATE_AWAITING_TXID
-            session["chain"] = chain
-            states[chat_id] = session
-            save_states(states)
-            
-            instruction_msg = (
-                f"Please send exactly **${total:.2f} USDT** on the **{chain_name}** network to the following address:\n\n"
-                f"`{target_address}`\n\n"
-                f"**Important**: Send exactly the requested amount. Once the transaction is sent, reply to this message with your Transaction Hash (TXID/TX Hash) to verify."
-            )
-            await event.reply(instruction_msg)
+        # Blockchain path (BEP20 or Polygon)
+        chain = "bsc" if text == "1" else "polygon"
+        chain_name = "BEP20 (Binance Smart Chain)" if chain == "bsc" else "Polygon"
+        target_address = "0xE9d2b69488DcFa424B535f765761b2da6ddE328f"
+        
+        session["state"] = STATE_AWAITING_TXID
+        session["chain"] = chain
+        states[chat_id] = session
+        save_states(states)
+        
+        instruction_msg = (
+            f"Please send exactly **${total:.2f} USDT** on the **{chain_name}** network to the address:\n\n"
+            f"`USDT - {target_address}`\n\n"
+            f"**Important**: Send exactly the requested amount. Once the transaction is sent, reply to this message with your Transaction Hash (TXID/TX Hash) to verify."
+        )
+        await event.reply(instruction_msg)
 
     elif state == STATE_AWAITING_TXID:
         tx_hash = (event.message.text or "").strip().lower()
@@ -1497,7 +1482,7 @@ async def tg_message_handler(event):
             
         chain = session.get("chain", "bsc")
         total = session.get("total", 0.50)
-        target_address = BSC_WALLET_ADDRESS if chain == "bsc" else POLYGON_WALLET_ADDRESS
+        target_address = "0xE9d2b69488DcFa424B535f765761b2da6ddE328f"
         
         status_msg = await event.reply("⌛ Verifying transaction on the blockchain, please wait...")
         
@@ -1539,7 +1524,7 @@ async def tg_message_handler(event):
             chain_name = "BEP20 (Binance Smart Chain)" if chain == "bsc" else "Polygon"
             await event.reply(
                 f"❌ **Verification Failed!**\n"
-                f"Could not find a confirmed USDT transfer of **${total:.2f}** to `{target_address}` in this transaction on the **{chain_name}** network.\n\n"
+                f"Could not find a confirmed USDT transfer of **${total:.2f}** to `USDT - {target_address}` in this transaction on the **{chain_name}** network.\n\n"
                 f"Please verify that the transaction is fully confirmed on the blockchain and you sent the correct amount, then reply with the correct TXID again."
             )
         
