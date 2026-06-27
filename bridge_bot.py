@@ -69,6 +69,7 @@ BINANCE_ID = os.getenv("PAYMENT_BINANCE_ID", "Not Configured")
 UPI_ID = os.getenv("PAYMENT_UPI_ID", "Not Configured")
 TRC20_ADDRESS = os.getenv("PAYMENT_TRC20_ADDRESS", "Not Configured")
 LTC_ADDRESS = os.getenv("PAYMENT_LTC_ADDRESS", "Not Configured")
+CRYPTO_WALLET_ADDRESS = os.getenv("PAYMENT_CRYPTO_WALLET_ADDRESS", "0x0000000000000000000000000000000000000000")
 
 # Proxy configuration list
 PROXIES = []
@@ -103,8 +104,10 @@ sqlite3.connect = custom_connect
 
 STATE_IDLE = "STATE_IDLE"
 STATE_AWAITING_COUNT = "STATE_AWAITING_COUNT"
+STATE_AWAITING_PAYMENT_METHOD = "STATE_AWAITING_PAYMENT_METHOD"
 STATE_AWAITING_CONFIRMATION = "STATE_AWAITING_CONFIRMATION"
 STATE_AWAITING_APPROVAL = "STATE_AWAITING_APPROVAL"
+STATE_AWAITING_TXID = "STATE_AWAITING_TXID"
 STATE_AWAITING_TOKEN = "STATE_AWAITING_TOKEN"
 
 def load_states():
@@ -199,6 +202,12 @@ def init_db():
                 qr_file_path TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'available',
                 FOREIGN KEY(panel_id) REFERENCES panels(panel_id)
+            );
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS used_txids (
+                tx_hash TEXT PRIMARY KEY,
+                used_at REAL
             );
         """)
 
@@ -315,6 +324,100 @@ def create_headless_driver(proxy=None):
             except Exception as retry_err:
                 print(f"[Error] Retry Chrome launch failed: {retry_err}")
             raise e
+
+
+def verify_evm_transaction(chain: str, tx_hash: str, expected_to: str, expected_amount: float) -> bool:
+    import urllib.request
+    import urllib.parse
+    import json
+
+    if chain == "bsc":
+        rpc_url = "https://bsc-dataseed.binance.org/"
+        usdt_contract = "0x55d398326f99059ff775485246999027b3197955"  # BSC USDT
+        decimals = 18
+    elif chain == "polygon":
+        rpc_url = "https://polygon-rpc.com/"
+        usdt_contract = "0xc2132d05d31c914a87c6611c10748aeb04b58e8f"  # Polygon USDT
+        decimals = 6
+    else:
+        print("[-] Invalid chain specified.")
+        return False
+
+    print(f"[+] Querying {chain.upper()} receipt for TX: {tx_hash}")
+    
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "eth_getTransactionReceipt",
+        "params": [tx_hash],
+        "id": 1
+    }
+    
+    headers = {"Content-Type": "application/json"}
+    
+    try:
+        req = urllib.request.Request(
+            rpc_url, 
+            data=json.dumps(payload).encode("utf-8"), 
+            headers=headers,
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            res_data = json.loads(response.read().decode("utf-8"))
+            
+        result = res_data.get("result")
+        if not result:
+            print("[-] Transaction receipt not found on chain yet.")
+            return False
+            
+        # Check transaction execution status (0x1 = success)
+        status = result.get("status")
+        if status != "0x1":
+            print(f"[-] Transaction failed or has status: {status}")
+            return False
+            
+        logs = result.get("logs", [])
+        transfer_signature = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+        
+        for idx, log in enumerate(logs):
+            log_address = log.get("address", "").lower()
+            if log_address != usdt_contract.lower():
+                continue
+                
+            topics = log.get("topics", [])
+            if not topics or topics[0].lower() != transfer_signature:
+                continue
+                
+            # Topics[2] contains the padded 'to' address (recipient)
+            if len(topics) < 3:
+                continue
+                
+            recipient_topic = topics[2]
+            # Convert 32-byte padded address to 20-byte address (take the last 40 hex characters)
+            recipient_address = "0x" + recipient_topic[-40:].lower()
+            
+            # Extract data (transfer value)
+            data_hex = log.get("data", "0x")
+            val_int = int(data_hex, 16) if data_hex != "0x" else 0
+            actual_amount = val_int / (10 ** decimals)
+            
+            print(f"[+] Found USDT transfer: To={recipient_address}, Amount={actual_amount}")
+            
+            # Verify recipient and amount
+            if recipient_address == expected_to.lower():
+                if actual_amount >= expected_amount - 0.001:
+                    print("[+] Verification SUCCESS!")
+                    return True
+                else:
+                    print(f"[-] Amount mismatch. Expected {expected_amount}, got {actual_amount}")
+            else:
+                print(f"[-] Recipient mismatch. Expected {expected_to.lower()}, got {recipient_address}")
+                
+        print("[-] No matching USDT transfer logs found in this transaction.")
+        return False
+        
+    except Exception as e:
+        print(f"[-] Error querying RPC: {e}")
+        return False
 
 
 def verify_stripe_payment(url: str) -> bool:
@@ -781,12 +884,12 @@ async def handle_individual_scanned(interaction: discord.Interaction, job_id: in
     with sqlite3.connect("sparky.db") as db:
         db.execute("UPDATE panels SET action_taken = 1 WHERE panel_id = ?", (panel_id,))
 
-    # Check Stripe verification using the public API endpoint query (polls for up to 4 minutes)
+    # Check Stripe verification using the public API endpoint query (polls for up to 1 minute)
     status_msg = await interaction.channel.send(f"⌛ Starting Stripe transaction verification for Job #{job_id}...")
     
     is_success = False
     start_time = time.time()
-    max_duration = 240  # 4 minutes
+    max_duration = 60  # 1 minute
     poll_interval = 5   # check every 5 seconds
     
     while time.time() - start_time < max_duration:
@@ -1317,7 +1420,7 @@ async def tg_message_handler(event):
             
         total = count * 0.50
         
-        session["state"] = STATE_AWAITING_CONFIRMATION
+        session["state"] = STATE_AWAITING_PAYMENT_METHOD
         session["count"] = count
         session["total"] = total
         states[chat_id] = session
@@ -1325,11 +1428,117 @@ async def tg_message_handler(event):
         
         payment_msg = (
             f"Total Amount: ${total:.2f} ({count} QRs * $0.50 each)\n\n"
-            f"Please pay using the following method:\n"
-            f"- Binance ID: `{BINANCE_ID}`\n\n"
-            f"Once you have sent the payment, please reply with 'Confirm' or 'Sent' to submit it for approval."
+            f"Please select your payment method:\n"
+            f"1. Binance ID (Admin Manual Verification)\n"
+            f"2. USDT - BEP20 / BSC (Instant Blockchain Verification)\n"
+            f"3. USDT - Polygon (Instant Blockchain Verification)\n\n"
+            f"Please reply with the number of your choice (1, 2, or 3)."
         )
         await event.reply(payment_msg)
+
+    elif state == STATE_AWAITING_PAYMENT_METHOD:
+        text = (event.message.text or "").strip()
+        if text not in ["1", "2", "3"]:
+            await event.reply("Please select a valid option by replying with 1, 2, or 3.")
+            return
+            
+        total = session.get("total", 0.50)
+        
+        if text == "1":
+            # Binance ID path (manual confirmation)
+            session["state"] = STATE_AWAITING_CONFIRMATION
+            states[chat_id] = session
+            save_states(states)
+            
+            payment_msg = (
+                f"Please pay **${total:.2f}** using Binance ID:\n"
+                f"`{BINANCE_ID}`\n\n"
+                f"Once you have completed the transfer, please reply with 'Confirm' or 'Sent' to submit it for approval."
+            )
+            await event.reply(payment_msg)
+            
+        else:
+            # Blockchain path (BEP20 or Polygon)
+            chain = "bsc" if text == "2" else "polygon"
+            chain_name = "BEP20 (Binance Smart Chain)" if chain == "bsc" else "Polygon"
+            
+            session["state"] = STATE_AWAITING_TXID
+            session["chain"] = chain
+            states[chat_id] = session
+            save_states(states)
+            
+            instruction_msg = (
+                f"Please send exactly **${total:.2f} USDT** on the **{chain_name}** network to the following address:\n\n"
+                f"`{CRYPTO_WALLET_ADDRESS}`\n\n"
+                f"**Important**: Send exactly the requested amount. Once the transaction is sent, reply to this message with your Transaction Hash (TXID/TX Hash) to verify."
+            )
+            await event.reply(instruction_msg)
+
+    elif state == STATE_AWAITING_TXID:
+        tx_hash = (event.message.text or "").strip().lower()
+        
+        if not tx_hash.startswith("0x"):
+            tx_hash = "0x" + tx_hash
+            
+        if len(tx_hash) != 66 or not all(c in "0123456789abcdef" for c in tx_hash[2:]):
+            await event.reply("❌ Invalid transaction hash format. Please ensure you copied the full TX Hash (66 characters starting with 0x).")
+            return
+            
+        # Check if TXID was already used to prevent double-spending
+        with sqlite3.connect("sparky.db") as db:
+            db.row_factory = sqlite3.Row
+            existing = db.execute("SELECT * FROM used_txids WHERE tx_hash = ?", (tx_hash,)).fetchone()
+            
+        if existing:
+            await event.reply("❌ This transaction has already been used to deposit. Please provide a fresh TXID.")
+            return
+            
+        chain = session.get("chain", "bsc")
+        total = session.get("total", 0.50)
+        
+        status_msg = await event.reply("⌛ Verifying transaction on the blockchain, please wait...")
+        
+        is_success = await asyncio.to_thread(
+            verify_evm_transaction, 
+            chain, 
+            tx_hash, 
+            CRYPTO_WALLET_ADDRESS, 
+            total
+        )
+        
+        try:
+            await status_msg.delete()
+        except:
+            pass
+            
+        if is_success:
+            # Prevent double spend by marking this TXID as used
+            with sqlite3.connect("sparky.db") as db:
+                db.execute("INSERT OR REPLACE INTO used_txids (tx_hash, used_at) VALUES (?, ?)", (tx_hash, time.time()))
+                
+                # Check if sender exists in DB
+                row = db.execute("SELECT * FROM senders WHERE chat_id = ?", (chat_id,)).fetchone()
+                if row:
+                    db.execute("UPDATE senders SET balance = balance + ? WHERE chat_id = ?", (total, chat_id))
+                else:
+                    db.execute("INSERT INTO senders (chat_id, username, balance) VALUES (?, ?, ?)", (chat_id, username, total))
+                    
+            # Move to awaiting QRs
+            session["state"] = STATE_AWAITING_TOKEN
+            states[chat_id] = session
+            save_states(states)
+            
+            await event.reply(
+                f"✅ **Payment Verified!** ${total:.2f} has been added to your balance.\n\n"
+                f"Please start sending your QR codes with the Stripe link in the same message."
+            )
+        else:
+            chain_name = "BEP20 (Binance Smart Chain)" if chain == "bsc" else "Polygon"
+            await event.reply(
+                f"❌ **Verification Failed!**\n"
+                f"Could not find a confirmed USDT transfer of **${total:.2f}** to `{CRYPTO_WALLET_ADDRESS}` in this transaction on the **{chain_name}** network.\n\n"
+                f"Please verify that the transaction is fully confirmed on the blockchain and you sent the correct amount, then reply with the correct TXID again."
+            )
         
     elif state == STATE_AWAITING_CONFIRMATION:
         text = (event.message.text or "").strip().lower()
