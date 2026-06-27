@@ -600,10 +600,10 @@ async def monitor_claimed_panels():
             offline_tracker.pop(panel_id, None)
             continue
             
-        # Check 2-minute total timeout
-        if now - claimed_at >= 120:
+        # Check 5-minute total timeout
+        if now - claimed_at >= 300:
             deduct = (action_taken == 0)
-            await handle_panel_failure(panel_id, worker_id, channel_id, reason="Timeout (2 minutes exceeded)", deduct_penalty=deduct)
+            await handle_panel_failure(panel_id, worker_id, channel_id, reason="Timeout (5 minutes exceeded)", deduct_penalty=deduct)
             offline_tracker.pop(panel_id, None)
             continue
             
@@ -711,7 +711,7 @@ async def handle_panel_claim(interaction: discord.Interaction, panel_id: int):
             f"**Instructions**:\n"
             f"1. Open each Stripe payment link below or scan the QRs to complete the payments.\n"
             f"2. Once payment is completed, click **Scanned** below each QR code to verify it.\n\n"
-            f"**Warning**: You have 2 minutes to complete this job. If you go offline or exceed 2 minutes, 20 coins will be deducted.\n"
+            f"**Warning**: You have 5 minutes to complete this job. If you go offline or exceed 5 minutes, 20 coins will be deducted.\n"
             f"**Strict Warning**: If you click **Scanned** on a QR that is NOT scanned or completed, **35 coins will be deducted** from your balance."
         ),
         color=discord.Color.purple()
@@ -777,9 +777,45 @@ async def handle_individual_scanned(interaction: discord.Interaction, job_id: in
         await interaction.followup.send("This job panel is no longer active for you.", ephemeral=True)
         return
 
-    # Check Stripe verification using the public API endpoint query
-    status_msg = await interaction.channel.send(f"⌛ Checking Stripe transaction status for Job #{job_id}...")
-    is_success = await asyncio.to_thread(verify_stripe_payment, job["stripe_url"])
+    # Set action_taken = 1 to prevent inactivity timeout penalty
+    with sqlite3.connect("sparky.db") as db:
+        db.execute("UPDATE panels SET action_taken = 1 WHERE panel_id = ?", (panel_id,))
+
+    # Check Stripe verification using the public API endpoint query (polls for up to 4 minutes)
+    status_msg = await interaction.channel.send(f"⌛ Starting Stripe transaction verification for Job #{job_id}...")
+    
+    is_success = False
+    start_time = time.time()
+    max_duration = 240  # 4 minutes
+    poll_interval = 5   # check every 5 seconds
+    
+    while time.time() - start_time < max_duration:
+        # Check if the panel was cancelled or failed by the monitor task in the background
+        with sqlite3.connect("sparky.db") as db:
+            db.row_factory = sqlite3.Row
+            p_status = db.execute("SELECT status FROM panels WHERE panel_id = ?", (panel_id,)).fetchone()
+            j_status = db.execute("SELECT status FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+            
+        if not p_status or p_status["status"] != "claimed" or not j_status or j_status["status"] != "available":
+            print(f"[System] Job #{job_id} or Panel #{panel_id} is no longer active. Exiting poll loop.")
+            try:
+                await status_msg.delete()
+            except:
+                pass
+            return
+
+        is_success = await asyncio.to_thread(verify_stripe_payment, job["stripe_url"])
+        if is_success:
+            break
+            
+        elapsed = int(time.time() - start_time)
+        try:
+            await status_msg.edit(content=f"⌛ Checking Stripe transaction status for Job #{job_id}... ({elapsed}s elapsed)")
+        except Exception:
+            pass
+            
+        await asyncio.sleep(poll_interval)
+        
     try:
         await status_msg.delete()
     except Exception:
