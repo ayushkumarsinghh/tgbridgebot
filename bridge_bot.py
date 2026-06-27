@@ -69,7 +69,8 @@ BINANCE_ID = os.getenv("PAYMENT_BINANCE_ID", "Not Configured")
 UPI_ID = os.getenv("PAYMENT_UPI_ID", "Not Configured")
 TRC20_ADDRESS = os.getenv("PAYMENT_TRC20_ADDRESS", "Not Configured")
 LTC_ADDRESS = os.getenv("PAYMENT_LTC_ADDRESS", "Not Configured")
-CRYPTO_WALLET_ADDRESS = os.getenv("PAYMENT_CRYPTO_WALLET_ADDRESS", "0x0000000000000000000000000000000000000000")
+BSC_WALLET_ADDRESS = os.getenv("PAYMENT_BSC_WALLET_ADDRESS", "0x0000000000000000000000000000000000000000")
+POLYGON_WALLET_ADDRESS = os.getenv("PAYMENT_POLYGON_WALLET_ADDRESS", "0x0000000000000000000000000000000000000000")
 
 # Proxy configuration list
 PROXIES = []
@@ -1461,6 +1462,7 @@ async def tg_message_handler(event):
             # Blockchain path (BEP20 or Polygon)
             chain = "bsc" if text == "2" else "polygon"
             chain_name = "BEP20 (Binance Smart Chain)" if chain == "bsc" else "Polygon"
+            target_address = BSC_WALLET_ADDRESS if chain == "bsc" else POLYGON_WALLET_ADDRESS
             
             session["state"] = STATE_AWAITING_TXID
             session["chain"] = chain
@@ -1469,7 +1471,7 @@ async def tg_message_handler(event):
             
             instruction_msg = (
                 f"Please send exactly **${total:.2f} USDT** on the **{chain_name}** network to the following address:\n\n"
-                f"`{CRYPTO_WALLET_ADDRESS}`\n\n"
+                f"`{target_address}`\n\n"
                 f"**Important**: Send exactly the requested amount. Once the transaction is sent, reply to this message with your Transaction Hash (TXID/TX Hash) to verify."
             )
             await event.reply(instruction_msg)
@@ -1495,6 +1497,7 @@ async def tg_message_handler(event):
             
         chain = session.get("chain", "bsc")
         total = session.get("total", 0.50)
+        target_address = BSC_WALLET_ADDRESS if chain == "bsc" else POLYGON_WALLET_ADDRESS
         
         status_msg = await event.reply("⌛ Verifying transaction on the blockchain, please wait...")
         
@@ -1502,7 +1505,7 @@ async def tg_message_handler(event):
             verify_evm_transaction, 
             chain, 
             tx_hash, 
-            CRYPTO_WALLET_ADDRESS, 
+            target_address, 
             total
         )
         
@@ -1536,7 +1539,7 @@ async def tg_message_handler(event):
             chain_name = "BEP20 (Binance Smart Chain)" if chain == "bsc" else "Polygon"
             await event.reply(
                 f"❌ **Verification Failed!**\n"
-                f"Could not find a confirmed USDT transfer of **${total:.2f}** to `{CRYPTO_WALLET_ADDRESS}` in this transaction on the **{chain_name}** network.\n\n"
+                f"Could not find a confirmed USDT transfer of **${total:.2f}** to `{target_address}` in this transaction on the **{chain_name}** network.\n\n"
                 f"Please verify that the transaction is fully confirmed on the blockchain and you sent the correct amount, then reply with the correct TXID again."
             )
         
