@@ -1421,44 +1421,18 @@ async def tg_message_handler(event):
             
         total = count * 0.50
         
-        session["state"] = STATE_AWAITING_PAYMENT_METHOD
+        session["state"] = STATE_AWAITING_TXID
         session["count"] = count
         session["total"] = total
         states[chat_id] = session
         save_states(states)
         
-        payment_msg = (
-            f"Total Amount: ${total:.2f} ({count} QRs * $0.50 each)\n\n"
-            f"Please select your payment method:\n"
-            f"1. USDT - BEP20 / BSC (Instant Blockchain Verification)\n"
-            f"2. USDT - Polygon (Instant Blockchain Verification)\n\n"
-            f"Please reply with the number of your choice (1 or 2)."
-        )
-        await event.reply(payment_msg)
-
-    elif state == STATE_AWAITING_PAYMENT_METHOD:
-        text = (event.message.text or "").strip()
-        if text not in ["1", "2"]:
-            await event.reply("Please select a valid option by replying with 1 or 2.")
-            return
-            
-        total = session.get("total", 0.50)
-        
-        # Blockchain path (BEP20 or Polygon)
-        chain = "bsc" if text == "1" else "polygon"
-        chain_name = "BEP20 (Binance Smart Chain)" if chain == "bsc" else "Polygon"
         target_address = "0xE9d2b69488DcFa424B535f765761b2da6ddE328f"
-        
-        session["state"] = STATE_AWAITING_TXID
-        session["chain"] = chain
-        states[chat_id] = session
-        save_states(states)
-        
-        instruction_msg = (
+        payment_msg = (
             f"Please send exactly **${total:.2f} USDT** on this address: `USDT - {target_address}`\n\n"
             f"Once the transaction is sent, please drop your Transaction Hash (TXID) below to verify."
         )
-        await event.reply(instruction_msg)
+        await event.reply(payment_msg)
 
     elif state == STATE_AWAITING_TXID:
         tx_hash = (event.message.text or "").strip().lower()
@@ -1479,19 +1453,30 @@ async def tg_message_handler(event):
             await event.reply("❌ This transaction has already been used to deposit. Please provide a fresh TXID.")
             return
             
-        chain = session.get("chain", "bsc")
         total = session.get("total", 0.50)
         target_address = "0xE9d2b69488DcFa424B535f765761b2da6ddE328f"
         
         status_msg = await event.reply("⌛ Verifying transaction on the blockchain, please wait...")
         
+        # Check BSC network first
         is_success = await asyncio.to_thread(
             verify_evm_transaction, 
-            chain, 
+            "bsc", 
             tx_hash, 
             target_address, 
             total
         )
+        
+        # If BSC fails, fall back to check Polygon network
+        if not is_success:
+            print("[System] BSC verification failed. Checking Polygon network...")
+            is_success = await asyncio.to_thread(
+                verify_evm_transaction, 
+                "polygon", 
+                tx_hash, 
+                target_address, 
+                total
+            )
         
         try:
             await status_msg.delete()
@@ -1520,10 +1505,9 @@ async def tg_message_handler(event):
                 f"Please start sending your QR codes with the Stripe link in the same message."
             )
         else:
-            chain_name = "BEP20 (Binance Smart Chain)" if chain == "bsc" else "Polygon"
             await event.reply(
                 f"❌ **Verification Failed!**\n"
-                f"Could not find a confirmed USDT transfer of **${total:.2f}** to `USDT - {target_address}` in this transaction on the **{chain_name}** network.\n\n"
+                f"Could not find a confirmed USDT transfer of **${total:.2f}** to `USDT - {target_address}` in this transaction on either the BSC (BEP20) or Polygon network.\n\n"
                 f"Please verify that the transaction is fully confirmed on the blockchain and you sent the correct amount, then reply with the correct TXID again."
             )
         
