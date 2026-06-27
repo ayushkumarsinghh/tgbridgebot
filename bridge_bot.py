@@ -110,6 +110,7 @@ STATE_AWAITING_CONFIRMATION = "STATE_AWAITING_CONFIRMATION"
 STATE_AWAITING_APPROVAL = "STATE_AWAITING_APPROVAL"
 STATE_AWAITING_TXID = "STATE_AWAITING_TXID"
 STATE_AWAITING_TOKEN = "STATE_AWAITING_TOKEN"
+STATE_AWAITING_DEPOSIT_AMOUNT = "STATE_AWAITING_DEPOSIT_AMOUNT"
 
 def load_states():
     if os.path.exists(STATES_FILE):
@@ -1351,16 +1352,27 @@ async def wait_and_process_uploads(chat_id: int, target_time: float):
 # --- TELEGRAM BOT EVENT HANDLERS ---
 @bot_client.on(events.NewMessage(pattern="/start"))
 async def tg_start_handler(event):
+    briefing_msg = (
+        "👋 **Welcome to the Bot!** Here is a list of available commands:\n\n"
+        "💸 `/deposit` - Request a new deposit (USDT BEP20 / Polygon)\n"
+        "🤖 `/startqr` - Start submitting QRs (requires balance)\n"
+        "💰 `/balance` - Check your current balance\n"
+        "📞 `/support` - Get support contact info"
+    )
+    await event.reply(briefing_msg)
+
+@bot_client.on(events.NewMessage(pattern="/deposit"))
+async def tg_deposit_handler(event):
     chat_id = event.chat_id
     states = load_states()
-    states[chat_id] = {"state": STATE_AWAITING_COUNT}
+    states[chat_id] = {"state": STATE_AWAITING_DEPOSIT_AMOUNT}
     save_states(states)
     
-    await event.reply("How many QRs will you be providing?")
+    await event.reply("How much would you like to deposit (in USD)?")
 
 @bot_client.on(events.NewMessage(pattern="/support"))
 async def tg_support_handler(event):
-    await event.reply("For support, please contact the owner: @Onnnnmi")
+    await event.reply("For support, please contact the owner: @SLEEPU69")
 
 @bot_client.on(events.NewMessage(pattern="/balance"))
 async def tg_balance_handler(event):
@@ -1372,8 +1384,8 @@ async def tg_balance_handler(event):
     bal = row["balance"] if row else 0.0
     await event.reply(f"Your current balance is: ${bal:.2f}")
 
-@bot_client.on(events.NewMessage(pattern=r"^/(usebalance|submit)$"))
-async def tg_use_balance_handler(event):
+@bot_client.on(events.NewMessage(pattern="/startqr"))
+async def tg_start_qr_handler(event):
     chat_id = event.chat_id
     with sqlite3.connect("sparky.db") as db:
         db.row_factory = sqlite3.Row
@@ -1381,18 +1393,14 @@ async def tg_use_balance_handler(event):
     
     bal = row["balance"] if row else 0.0
     if bal < 0.50:
-        await event.reply("❌ You do not have enough balance to submit (Minimum: $0.50). Please use /start to request a deposit.")
+        await event.reply("❌ You do not have enough balance to submit (Minimum: $0.50). Please use /deposit to request a deposit.")
         return
         
     states = load_states()
-    states[chat_id] = {"state": STATE_AWAITING_TOKEN}
+    states[chat_id] = {"state": STATE_AWAITING_COUNT}
     save_states(states)
     
-    await event.reply(
-        f"Your current balance is: ${bal:.2f}\n\n"
-        "Please send QRs with the Stripe payment link\n"
-        "* DONT SEND ANY UNNECCESSARY THINGS *"
-    )
+    await event.reply("How many QRs will you be sending?")
 
 @bot_client.on(events.NewMessage)
 async def tg_message_handler(event):
@@ -1421,15 +1429,49 @@ async def tg_message_handler(event):
             
         total = count * 0.50
         
-        session["state"] = STATE_AWAITING_TXID
+        # Get sender's balance
+        with sqlite3.connect("sparky.db") as db:
+            db.row_factory = sqlite3.Row
+            row = db.execute("SELECT balance FROM senders WHERE chat_id = ?", (chat_id,)).fetchone()
+        bal = row["balance"] if row else 0.0
+        
+        if bal < total:
+            await event.reply(
+                f"❌ Insufficient balance for {count} QRs (requires ${total:.2f}, but you have ${bal:.2f}).\n\n"
+                f"Please use /deposit to add more balance, or reply with a smaller number."
+            )
+            return
+            
+        session["state"] = STATE_AWAITING_TOKEN
         session["count"] = count
         session["total"] = total
         states[chat_id] = session
         save_states(states)
         
+        await event.reply(
+            f"Your current balance is: ${bal:.2f} (using ${total:.2f} for this batch of {count} QRs).\n\n"
+            f"Please send QRs with the Stripe payment link\n"
+            f"* DONT SEND ANY UNNECCESSARY THINGS *"
+        )
+
+    elif state == STATE_AWAITING_DEPOSIT_AMOUNT:
+        text = (event.message.text or "").strip()
+        try:
+            amount = float(text)
+            if amount <= 0:
+                raise ValueError()
+        except ValueError:
+            await event.reply("Please enter a valid positive decimal amount (e.g., 5 or 10.50).")
+            return
+            
+        session["state"] = STATE_AWAITING_TXID
+        session["total"] = amount
+        states[chat_id] = session
+        save_states(states)
+        
         target_address = "0xE9d2b69488DcFa424B535f765761b2da6ddE328f"
         payment_msg = (
-            f"Please send exactly **${total:.2f} USDT** on this address: USDT - `{target_address}`\n\n"
+            f"Please send exactly **${amount:.2f} USDT** on this address: USDT - `{target_address}`\n\n"
             f"Once the transaction is sent, please drop your Transaction Hash (TXID) below to verify."
         )
         await event.reply(payment_msg)
