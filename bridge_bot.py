@@ -879,13 +879,13 @@ async def handle_individual_scanned(interaction: discord.Interaction, job_id: in
         
         await interaction.channel.send(f"🎉 **Job #{job_id} Verified!** 10 coins added to your balance.")
         
-        # Check if all jobs in this panel are now success
+        # Check if all jobs in this panel are now completed (success or failed)
         with sqlite3.connect("sparky.db") as db:
             db.row_factory = sqlite3.Row
             total_jobs = db.execute("SELECT COUNT(*) FROM jobs WHERE panel_id = ?", (panel_id,)).fetchone()[0]
-            success_jobs = db.execute("SELECT COUNT(*) FROM jobs WHERE panel_id = ? AND status = 'success'", (panel_id,)).fetchone()[0]
+            completed_jobs = db.execute("SELECT COUNT(*) FROM jobs WHERE panel_id = ? AND status IN ('success', 'failed')", (panel_id,)).fetchone()[0]
             
-        if success_jobs >= total_jobs:
+        if completed_jobs >= total_jobs:
             # Mark panel as success
             with sqlite3.connect("sparky.db") as db:
                 db.execute("UPDATE panels SET status = 'success' WHERE panel_id = ?", (panel_id,))
@@ -896,14 +896,14 @@ async def handle_individual_scanned(interaction: discord.Interaction, job_id: in
                 if log_channel:
                     log_embed = discord.Embed(
                         title="Job Closed",
-                        description=f"Panel ID: {panel_id}\nStatus: **Success**\nWorker: {interaction.user.mention}",
+                        description=f"Panel ID: {panel_id}\nStatus: **Completed**\nWorker: {interaction.user.mention}",
                         color=discord.Color.green()
                     )
                     await log_channel.send(embed=log_embed)
             except Exception as e:
                 print(f"Error sending log message: {e}")
                 
-            await interaction.channel.send("🎉 **All payments verified successfully!** Channel will delete in 5 seconds...")
+            await interaction.channel.send("🎉 **All payments in this panel have been completed or failed!** Channel will delete in 5 seconds...")
             await asyncio.sleep(5)
             
             # Delete channel
@@ -923,7 +923,77 @@ async def handle_individual_scanned(interaction: discord.Interaction, job_id: in
                     except:
                         pass
     else:
-        await interaction.channel.send(f"❌ **Verification failed for Job #{job_id}.** Stripe payment is not completed/succeeded yet. Please ensure you completed payment before clicking Scanned.")
+        # Update job status to 'failed' in DB
+        with sqlite3.connect("sparky.db") as db:
+            db.execute("UPDATE jobs SET status = 'failed' WHERE job_id = ?", (job_id,))
+            # Recredit the Telegram sender by adding $0.50 back to their balance
+            db.execute("UPDATE senders SET balance = balance + 0.50 WHERE chat_id = ?", (job["tg_chat_id"],))
+            
+        # Reply "Failed" to Telegram user
+        try:
+            await bot_client.send_message(
+                job["tg_chat_id"], 
+                "Failed", 
+                reply_to=job["tg_msg_id"]
+            )
+        except Exception as tg_err:
+            print(f"Error sending Failed reply to Telegram sender: {tg_err}")
+            
+        # Edit the message on Discord to remove the button and show Failed status
+        try:
+            embed = interaction.message.embeds[0]
+            embed.color = discord.Color.red()
+            embed.add_field(name="Status", value="❌ Verification Failed (No coins credited)", inline=False)
+            await interaction.message.edit(embed=embed, view=None)
+        except Exception as edit_err:
+            print(f"Error editing message to failed status: {edit_err}")
+            
+        # Send channel notification
+        await interaction.channel.send(f"Verification failed for job number {job_id} . Stripe payment is not completed/succeeded yet . No bal is added")
+        
+        # Check if all jobs in this panel are now finished (success or failed)
+        with sqlite3.connect("sparky.db") as db:
+            db.row_factory = sqlite3.Row
+            total_jobs = db.execute("SELECT COUNT(*) FROM jobs WHERE panel_id = ?", (panel_id,)).fetchone()[0]
+            completed_jobs = db.execute("SELECT COUNT(*) FROM jobs WHERE panel_id = ? AND status IN ('success', 'failed')", (panel_id,)).fetchone()[0]
+            
+        if completed_jobs >= total_jobs:
+            # Mark panel as success (or completed) since all jobs are finalized
+            with sqlite3.connect("sparky.db") as db:
+                db.execute("UPDATE panels SET status = 'success' WHERE panel_id = ?", (panel_id,))
+                
+            # Send Log to Log Channel
+            try:
+                log_channel = await get_or_fetch_channel(DISCORD_LOG_CHANNEL_ID)
+                if log_channel:
+                    log_embed = discord.Embed(
+                        title="Job Closed",
+                        description=f"Panel ID: {panel_id}\nStatus: **Closed** (All QRs processed)\nWorker: {interaction.user.mention}",
+                        color=discord.Color.green()
+                    )
+                    await log_channel.send(embed=log_embed)
+            except Exception as e:
+                print(f"Error sending log message: {e}")
+                
+            await interaction.channel.send("🎉 **All jobs in this panel have been completed or failed!** Channel will delete in 5 seconds...")
+            await asyncio.sleep(5)
+            
+            # Delete channel
+            try:
+                await interaction.channel.delete(reason="Panel completed successfully")
+            except Exception as e:
+                print(f"[Error] Failed to delete completed channel: {e}")
+                
+            # Cleanup QR files
+            with sqlite3.connect("sparky.db") as db:
+                db.row_factory = sqlite3.Row
+                jobs_in_panel = db.execute("SELECT * FROM jobs WHERE panel_id = ?", (panel_id,)).fetchall()
+            for j in jobs_in_panel:
+                if os.path.exists(j["qr_file_path"]):
+                    try:
+                        os.remove(j["qr_file_path"])
+                    except:
+                        pass
 
 async def handle_panel_cancel(interaction: discord.Interaction, panel_id: int):
     await interaction.response.defer()
