@@ -603,6 +603,30 @@ async def handle_panel_failure(panel_id: int, worker_id: int, channel_id: int, r
                 "INSERT INTO workers (user_id, balance) VALUES (?, 0) ON CONFLICT(user_id) DO UPDATE SET balance = MAX(0, balance - 20)",
                 (worker_id,)
             )
+            # Retrieve new balance
+            db.row_factory = sqlite3.Row
+            row = db.execute("SELECT balance FROM workers WHERE user_id = ?", (worker_id,)).fetchone()
+            new_bal = row["balance"] if row else 0
+
+        # Log to hardcoded channel 1520019495626735718
+        try:
+            coin_log_channel = await get_or_fetch_channel(1520019495626735718)
+            if coin_log_channel:
+                coin_embed = discord.Embed(
+                    title="⚠️ Panel Failure Penalty",
+                    description=(
+                        f"**Worker**: <@{worker_id}> (ID: `{worker_id}`)\n"
+                        f"**Panel ID**: `{panel_id}`\n"
+                        f"**Reason**: {reason}\n"
+                        f"**Amount**: `-20 coins`\n"
+                        f"**New Balance**: `{new_bal} coins`"
+                    ),
+                    color=discord.Color.red(),
+                    timestamp=datetime.datetime.utcnow()
+                )
+                await coin_log_channel.send(embed=coin_embed)
+        except Exception as e:
+            print(f"Error logging panel failure coin deduction: {e}")
             
     with sqlite3.connect("sparky.db") as db:
         db.execute("UPDATE panels SET status = 'failed' WHERE panel_id = ?", (panel_id,))
@@ -791,16 +815,12 @@ async def handle_payout_approval(interaction: discord.Interaction, worker_id: in
     embed.title = "Payout Approved"
     embed.add_field(name="Approved By", value=interaction.user.mention, inline=False)
     
-    await interaction.message.edit(embed=embed, view=None)
+    await interaction.message.edit(
+        content=f"✅ Payout Approved for <@{worker_id}>! That your funds are on the way",
+        embed=embed,
+        view=None
+    )
     await interaction.followup.send("✅ Payout approved successfully.", ephemeral=True)
-    
-    # Send a short message pinging the worker
-    try:
-        payout_channel = await get_or_fetch_channel(1520675082949890088)
-        if payout_channel:
-            await payout_channel.send(f"<@{worker_id}> That your funds are on the way")
-    except Exception as e:
-        print(f"Error notifying worker of approved payout: {e}")
 
 async def handle_panel_claim(interaction: discord.Interaction, panel_id: int):
     await interaction.response.defer(ephemeral=True)
@@ -989,6 +1009,30 @@ async def handle_individual_scanned(interaction: discord.Interaction, job_id: in
                 (interaction.user.id, str(interaction.user),)
             )
             db.execute("UPDATE jobs SET status = 'success' WHERE job_id = ?", (job_id,))
+            
+            # Retrieve new balance
+            db.row_factory = sqlite3.Row
+            row = db.execute("SELECT balance FROM workers WHERE user_id = ?", (interaction.user.id,)).fetchone()
+            new_bal = row["balance"] if row else 10
+
+        # Log to hardcoded channel 1520019495626735718
+        try:
+            coin_log_channel = await get_or_fetch_channel(1520019495626735718)
+            if coin_log_channel:
+                coin_embed = discord.Embed(
+                    title="🪙 QR Scanned Coin Credit",
+                    description=(
+                        f"**Worker**: {interaction.user.mention} (ID: `{interaction.user.id}`)\n"
+                        f"**Job ID**: `{job_id}`\n"
+                        f"**Amount**: `+10 coins`\n"
+                        f"**New Balance**: `{new_bal} coins`"
+                    ),
+                    color=discord.Color.green(),
+                    timestamp=datetime.datetime.utcnow()
+                )
+                await coin_log_channel.send(embed=coin_embed)
+        except Exception as e:
+            print(f"Error logging QR scanned coin credit: {e}")
             
         # Reply Success on Telegram, replying the stripe link / qr
         try:
@@ -1242,6 +1286,25 @@ async def add_coins_cmd(ctx, member: discord.Member, amount: int):
     new_bal = row["balance"] if row else amount
     await ctx.send(f"✅ Added **{amount} coins** to {member.mention}. New Balance: **{new_bal} coins**.")
 
+    # Log to hardcoded channel 1520019495626735718
+    try:
+        log_channel = await get_or_fetch_channel(1520019495626735718)
+        if log_channel:
+            embed = discord.Embed(
+                title="🪙 Coins Added",
+                description=(
+                    f"**Admin**: {ctx.author.mention} (ID: `{ctx.author.id}`)\n"
+                    f"**Worker**: {member.mention} (ID: `{member.id}`)\n"
+                    f"**Amount**: `+{amount} coins`\n"
+                    f"**New Balance**: `{new_bal} coins`"
+                ),
+                color=discord.Color.green(),
+                timestamp=datetime.datetime.utcnow()
+            )
+            await log_channel.send(embed=embed)
+    except Exception as e:
+        print(f"Error logging coin addition: {e}")
+
 @discord_bot.command(name="deduct")
 async def deduct_coins_cmd(ctx, member: discord.Member, amount: int):
     if not is_admin_user(ctx.author.id, ctx.author.guild_permissions):
@@ -1262,6 +1325,25 @@ async def deduct_coins_cmd(ctx, member: discord.Member, amount: int):
         
     new_bal = row["balance"] if row else 0
     await ctx.send(f"✅ Deducted **{amount} coins** from {member.mention}. New Balance: **{new_bal} coins**.")
+
+    # Log to hardcoded channel 1520019495626735718
+    try:
+        log_channel = await get_or_fetch_channel(1520019495626735718)
+        if log_channel:
+            embed = discord.Embed(
+                title="🪙 Coins Deducted",
+                description=(
+                    f"**Admin**: {ctx.author.mention} (ID: `{ctx.author.id}`)\n"
+                    f"**Worker**: {member.mention} (ID: `{member.id}`)\n"
+                    f"**Amount**: `-{amount} coins`\n"
+                    f"**New Balance**: `{new_bal} coins`"
+                ),
+                color=discord.Color.red(),
+                timestamp=datetime.datetime.utcnow()
+            )
+            await log_channel.send(embed=embed)
+    except Exception as e:
+        print(f"Error logging coin deduction: {e}")
 
 # --- DISCORD USER MANAGEMENT COMMANDS ---
 @discord_bot.command(name="adduser")
@@ -1358,6 +1440,24 @@ async def withdraw_cmd(ctx):
     # Deduct the balance from worker in DB immediately to prevent double spending
     with sqlite3.connect("sparky.db") as db:
         db.execute("UPDATE workers SET balance = balance - ? WHERE user_id = ?", (bal, ctx.author.id))
+        
+    # Log to hardcoded channel 1520019495626735718
+    try:
+        coin_log_channel = await get_or_fetch_channel(1520019495626735718)
+        if coin_log_channel:
+            coin_embed = discord.Embed(
+                title="🪙 Payout Requested (Deduction)",
+                description=(
+                    f"**Worker**: {ctx.author.mention} (ID: `{ctx.author.id}`)\n"
+                    f"**Amount**: `-{bal} coins`\n"
+                    f"**New Balance**: `0 coins`"
+                ),
+                color=discord.Color.orange(),
+                timestamp=datetime.datetime.utcnow()
+            )
+            await coin_log_channel.send(embed=coin_embed)
+    except Exception as e:
+        print(f"Error logging payout request deduction: {e}")
         
     # Create the embed
     embed = discord.Embed(
@@ -1785,6 +1885,24 @@ async def tg_message_handler(event):
                 f"✅ **Payment Verified!** ${total:.2f} has been added to your balance.\n\n"
                 f"Please start sending your QR codes with the Stripe link in the same message."
             )
+
+            # Log to Discord approval channel
+            try:
+                channel = await get_or_fetch_channel(DISCORD_APPROVAL_CHANNEL_ID)
+                if channel:
+                    embed = discord.Embed(
+                        title="💰 Successful Crypto Deposit",
+                        description=(
+                            f"**Telegram User**: @{username} (ID: `{chat_id}`)\n"
+                            f"**Amount**: **${total:.2f} USDT**\n"
+                            f"**TXID**: `{tx_hash}`"
+                        ),
+                        color=discord.Color.green(),
+                        timestamp=datetime.datetime.utcnow()
+                    )
+                    await channel.send(embed=embed)
+            except Exception as d_err:
+                print(f"Error logging successful deposit to Discord: {d_err}")
         else:
             await event.reply(
                 f"❌ **Verification Failed!**\n"
