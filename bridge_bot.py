@@ -8,6 +8,7 @@ import asyncio
 import time
 import re
 import sqlite3
+import datetime
 
 # --- Auto-Installer for Dependencies ---
 def install_and_import(package, import_name=None):
@@ -213,6 +214,29 @@ def init_db():
                 used_at REAL
             );
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
+        """)
+
+def get_setting(key, default=None):
+    with sqlite3.connect("sparky.db") as db:
+        row = db.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    if row:
+        val = row[0]
+        if isinstance(default, int):
+            try:
+                return int(val)
+            except ValueError:
+                return default
+        return val
+    return default
+
+def set_setting(key, value):
+    with sqlite3.connect("sparky.db") as db:
+        db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
 
 # Initialize Clients
 SESSION_PATH = os.getenv("SESSION_FILE_PATH", "bot_session")
@@ -748,6 +772,35 @@ async def on_interaction(interaction: discord.Interaction):
         elif custom_id.startswith("cancel_panel_"):
             panel_id = int(custom_id.split("_")[-1])
             await handle_panel_cancel(interaction, panel_id)
+        elif custom_id.startswith("approve_payout_"):
+            parts = custom_id.split("_")
+            worker_id = int(parts[2])
+            amount = int(parts[3])
+            await handle_payout_approval(interaction, worker_id, amount)
+
+async def handle_payout_approval(interaction: discord.Interaction, worker_id: int, amount: int):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("❌ Only the bot owner can approve payouts.", ephemeral=True)
+        return
+        
+    await interaction.response.defer(ephemeral=True)
+    
+    # Update interaction message embed
+    embed = interaction.message.embeds[0]
+    embed.color = discord.Color.green()
+    embed.title = "Payout Approved"
+    embed.add_field(name="Approved By", value=interaction.user.mention, inline=False)
+    
+    await interaction.message.edit(embed=embed, view=None)
+    await interaction.followup.send("✅ Payout approved successfully.", ephemeral=True)
+    
+    # Send a short message pinging the worker
+    try:
+        payout_channel = await get_or_fetch_channel(1520675082949890088)
+        if payout_channel:
+            await payout_channel.send(f"<@{worker_id}> That your funds are on the way")
+    except Exception as e:
+        print(f"Error notifying worker of approved payout: {e}")
 
 async def handle_panel_claim(interaction: discord.Interaction, panel_id: int):
     await interaction.response.defer(ephemeral=True)
@@ -1265,6 +1318,108 @@ async def tgstart_cmd(ctx):
     global tg_service_active
     tg_service_active = True
     await ctx.send("✅ Telegram bot services have been **resumed**.")
+
+@discord_bot.command(name="withdraw")
+async def withdraw_cmd(ctx):
+    # Check current balance of worker
+    with sqlite3.connect("sparky.db") as db:
+        db.row_factory = sqlite3.Row
+        row = db.execute("SELECT balance FROM workers WHERE user_id = ?", (ctx.author.id,)).fetchone()
+        
+    bal = row["balance"] if row else 0
+    min_withdraw = get_setting("withdraw_min", 100)
+    
+    if bal < min_withdraw:
+        await ctx.send(f"❌ You do not have enough balance to withdraw. Minimum is **{min_withdraw} coins** (your balance: **{bal} coins**).")
+        return
+        
+    prompt = await ctx.send(
+        f"🪙 You have **{bal} coins**. Please reply to this message with your UPI ID / payout details, or upload your payment QR code image within 60 seconds."
+    )
+    
+    def check(m):
+        return m.author == ctx.author and m.channel == ctx.channel
+        
+    try:
+        msg = await discord_bot.wait_for('message', check=check, timeout=60.0)
+    except asyncio.TimeoutError:
+        await prompt.edit(content="❌ Payout request timed out. Please run `!withdraw` again when ready.")
+        return
+        
+    payout_details = msg.content.strip() if msg.content else "No text details provided"
+    qr_url = None
+    if msg.attachments:
+        qr_url = msg.attachments[0].url
+        
+    if not msg.content and not msg.attachments:
+        await ctx.send("❌ Payout request cancelled: No details or QR attachment provided.")
+        return
+        
+    # Deduct the balance from worker in DB immediately to prevent double spending
+    with sqlite3.connect("sparky.db") as db:
+        db.execute("UPDATE workers SET balance = balance - ? WHERE user_id = ?", (bal, ctx.author.id))
+        
+    # Create the embed
+    embed = discord.Embed(
+        title="Payout Request Submitted",
+        description=(
+            f"**Worker**: {ctx.author.mention} (ID: `{ctx.author.id}`)\n"
+            f"**Amount**: **{bal} coins**\n"
+            f"**Details**: {payout_details}"
+        ),
+        color=discord.Color.gold(),
+        timestamp=datetime.datetime.utcnow()
+    )
+    if qr_url:
+        embed.set_image(url=qr_url)
+        
+    # Add the approve button
+    # Custom ID format: approve_payout_<worker_id>_<amount>
+    view = discord.ui.View(timeout=None)
+    view.add_item(
+        discord.ui.Button(
+            label="Approved", 
+            style=discord.ButtonStyle.success, 
+            custom_id=f"approve_payout_{ctx.author.id}_{bal}"
+        )
+    )
+    
+    # Forward it to the payout channel 1520675082949890088
+    try:
+        payout_channel = await get_or_fetch_channel(1520675082949890088)
+        if payout_channel:
+            await payout_channel.send(
+                content=f"🔔 New payout request from {ctx.author.mention}!",
+                embed=embed,
+                view=view
+            )
+            await ctx.send(f"✅ Your payout request for **{bal} coins** has been submitted for approval.")
+        else:
+            # If channel is not found, refund balance and raise error
+            with sqlite3.connect("sparky.db") as db:
+                db.execute("UPDATE workers SET balance = balance + ? WHERE user_id = ?", (bal, ctx.author.id))
+            await ctx.send("❌ Error: Payout channel not found. Payout request cancelled and balance refunded.")
+    except Exception as e:
+        print(f"Error submitting payout: {e}")
+        # Refund on failure
+        with sqlite3.connect("sparky.db") as db:
+            db.execute("UPDATE workers SET balance = balance + ? WHERE user_id = ?", (bal, ctx.author.id))
+        await ctx.send(f"❌ Failed to submit payout request: {e}. Balance refunded.")
+
+
+@discord_bot.command(name="withdrawminset")
+async def withdrawminset_cmd(ctx, amount: int):
+    if not is_admin_user(ctx.author.id, ctx.author.guild_permissions):
+        await ctx.send("❌ You do not have permission to run this command.")
+        return
+        
+    if amount <= 0:
+        await ctx.send("❌ Minimum amount must be greater than zero.")
+        return
+        
+    set_setting("withdraw_min", amount)
+    await ctx.send(f"✅ Minimum withdrawal limit has been set to **{amount} coins**.")
+
 
 @discord_bot.command(name="jobs", aliases=["active"])
 async def active_jobs_cmd(ctx):
