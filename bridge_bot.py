@@ -1345,6 +1345,129 @@ async def deduct_coins_cmd(ctx, member: discord.Member, amount: int):
     except Exception as e:
         print(f"Error logging coin deduction: {e}")
 
+@discord_bot.command(name="tgbaladd")
+async def tgbaladd_cmd(ctx, tg_user: str, amount: float):
+    if not is_admin_user(ctx.author.id, ctx.author.guild_permissions):
+        await ctx.send("❌ You do not have permission to run this command.")
+        return
+        
+    if amount <= 0:
+        await ctx.send("❌ Amount must be greater than zero.")
+        return
+        
+    tg_user = tg_user.strip()
+    is_id = False
+    try:
+        chat_id = int(tg_user)
+        is_id = True
+    except ValueError:
+        username = tg_user.lstrip("@").lower()
+        
+    with sqlite3.connect("sparky.db") as db:
+        db.row_factory = sqlite3.Row
+        if is_id:
+            row = db.execute("SELECT * FROM senders WHERE chat_id = ?", (chat_id,)).fetchone()
+            if row:
+                db.execute("UPDATE senders SET balance = balance + ? WHERE chat_id = ?", (amount, chat_id))
+                username_val = row["username"] or "Unknown"
+            else:
+                db.execute("INSERT INTO senders (chat_id, username, balance) VALUES (?, ?, ?)", (chat_id, "Unknown", amount))
+                username_val = "Unknown"
+            new_row = db.execute("SELECT balance FROM senders WHERE chat_id = ?", (chat_id,)).fetchone()
+        else:
+            row = db.execute("SELECT * FROM senders WHERE LOWER(username) = ?", (username,)).fetchone()
+            if row:
+                chat_id = row["chat_id"]
+                db.execute("UPDATE senders SET balance = balance + ? WHERE chat_id = ?", (amount, chat_id))
+                username_val = row["username"]
+            else:
+                await ctx.send(f"❌ Could not find a Telegram user with username **@{username}** in the database.")
+                return
+            new_row = db.execute("SELECT balance FROM senders WHERE chat_id = ?", (chat_id,)).fetchone()
+            
+    new_bal = new_row["balance"] if new_row else amount
+    await ctx.send(f"✅ Added **${amount:.2f}** to Telegram user **@{username_val}** (ID: `{chat_id}`). New Balance: **${new_bal:.2f}**.")
+
+    # Log to hardcoded channel 1520019495626735718
+    try:
+        log_channel = await get_or_fetch_channel(1520019495626735718)
+        if log_channel:
+            embed = discord.Embed(
+                title="💰 TG User Balance Added",
+                description=(
+                    f"**Admin**: {ctx.author.mention} (ID: `{ctx.author.id}`)\n"
+                    f"**Telegram User**: @{username_val} (ID: `{chat_id}`)\n"
+                    f"**Amount**: `+${amount:.2f}`\n"
+                    f"**New Balance**: `${new_bal:.2f}`"
+                ),
+                color=discord.Color.green(),
+                timestamp=datetime.datetime.utcnow()
+            )
+            await log_channel.send(embed=embed)
+    except Exception as e:
+        print(f"Error logging TG balance addition: {e}")
+
+
+@discord_bot.command(name="tgbaldeduct")
+async def tgbaldeduct_cmd(ctx, tg_user: str, amount: float):
+    if not is_admin_user(ctx.author.id, ctx.author.guild_permissions):
+        await ctx.send("❌ You do not have permission to run this command.")
+        return
+        
+    if amount <= 0:
+        await ctx.send("❌ Amount must be greater than zero.")
+        return
+        
+    tg_user = tg_user.strip()
+    is_id = False
+    try:
+        chat_id = int(tg_user)
+        is_id = True
+    except ValueError:
+        username = tg_user.lstrip("@").lower()
+        
+    with sqlite3.connect("sparky.db") as db:
+        db.row_factory = sqlite3.Row
+        if is_id:
+            row = db.execute("SELECT * FROM senders WHERE chat_id = ?", (chat_id,)).fetchone()
+            if not row:
+                await ctx.send(f"❌ Telegram user with ID `{chat_id}` not found in the database.")
+                return
+            username_val = row["username"] or "Unknown"
+            db.execute("UPDATE senders SET balance = MAX(0.0, balance - ?) WHERE chat_id = ?", (amount, chat_id))
+            new_row = db.execute("SELECT balance FROM senders WHERE chat_id = ?", (chat_id,)).fetchone()
+        else:
+            row = db.execute("SELECT * FROM senders WHERE LOWER(username) = ?", (username,)).fetchone()
+            if not row:
+                await ctx.send(f"❌ Telegram user with username **@{username}** not found in the database.")
+                return
+            chat_id = row["chat_id"]
+            username_val = row["username"]
+            db.execute("UPDATE senders SET balance = MAX(0.0, balance - ?) WHERE chat_id = ?", (amount, chat_id))
+            new_row = db.execute("SELECT balance FROM senders WHERE chat_id = ?", (chat_id,)).fetchone()
+            
+    new_bal = new_row["balance"] if new_row else 0.0
+    await ctx.send(f"✅ Deducted **${amount:.2f}** from Telegram user **@{username_val}** (ID: `{chat_id}`). New Balance: **${new_bal:.2f}**.")
+
+    # Log to hardcoded channel 1520019495626735718
+    try:
+        log_channel = await get_or_fetch_channel(1520019495626735718)
+        if log_channel:
+            embed = discord.Embed(
+                title="💰 TG User Balance Deducted",
+                description=(
+                    f"**Admin**: {ctx.author.mention} (ID: `{ctx.author.id}`)\n"
+                    f"**Telegram User**: @{username_val} (ID: `{chat_id}`)\n"
+                    f"**Amount**: `-${amount:.2f}`\n"
+                    f"**New Balance**: `${new_bal:.2f}`"
+                ),
+                color=discord.Color.red(),
+                timestamp=datetime.datetime.utcnow()
+            )
+            await log_channel.send(embed=embed)
+    except Exception as e:
+        print(f"Error logging TG balance deduction: {e}")
+
 # --- DISCORD USER MANAGEMENT COMMANDS ---
 @discord_bot.command(name="adduser")
 async def adduser_cmd(ctx, member: discord.Member):
