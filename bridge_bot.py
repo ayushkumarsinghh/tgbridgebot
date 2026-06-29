@@ -1378,11 +1378,26 @@ async def tgbaladd_cmd(ctx, tg_user: str, amount: float):
             row = db.execute("SELECT * FROM senders WHERE LOWER(username) = ?", (username,)).fetchone()
             if row:
                 chat_id = row["chat_id"]
-                db.execute("UPDATE senders SET balance = balance + ? WHERE chat_id = ?", (amount, chat_id))
                 username_val = row["username"]
+                db.execute("UPDATE senders SET balance = balance + ? WHERE chat_id = ?", (amount, chat_id))
             else:
-                await ctx.send(f"❌ Could not find a Telegram user with username **@{username}** in the database.")
-                return
+                # Attempt to resolve username via Telethon bot_client lookup
+                try:
+                    entity = await bot_client.get_entity(username)
+                    if entity:
+                        chat_id = entity.id
+                        username_val = entity.username or username
+                        db.execute(
+                            "INSERT INTO senders (chat_id, username, balance) VALUES (?, ?, ?)",
+                            (chat_id, username_val, amount)
+                        )
+                    else:
+                        await ctx.send(f"❌ Could not find a Telegram user with username **@{username}** in the database or Telegram lookup.")
+                        return
+                except Exception as lookup_err:
+                    print(f"Telethon lookup failed for {username}: {lookup_err}")
+                    await ctx.send(f"❌ Could not find a Telegram user with username **@{username}** in the database, and Telegram lookup failed.")
+                    return
             new_row = db.execute("SELECT balance FROM senders WHERE chat_id = ?", (chat_id,)).fetchone()
             
     new_bal = new_row["balance"] if new_row else amount
@@ -1438,12 +1453,29 @@ async def tgbaldeduct_cmd(ctx, tg_user: str, amount: float):
             new_row = db.execute("SELECT balance FROM senders WHERE chat_id = ?", (chat_id,)).fetchone()
         else:
             row = db.execute("SELECT * FROM senders WHERE LOWER(username) = ?", (username,)).fetchone()
-            if not row:
-                await ctx.send(f"❌ Telegram user with username **@{username}** not found in the database.")
-                return
-            chat_id = row["chat_id"]
-            username_val = row["username"]
-            db.execute("UPDATE senders SET balance = MAX(0.0, balance - ?) WHERE chat_id = ?", (amount, chat_id))
+            if row:
+                chat_id = row["chat_id"]
+                username_val = row["username"]
+                db.execute("UPDATE senders SET balance = MAX(0.0, balance - ?) WHERE chat_id = ?", (amount, chat_id))
+            else:
+                # Attempt to resolve username via Telethon bot_client lookup
+                try:
+                    entity = await bot_client.get_entity(username)
+                    if entity:
+                        chat_id = entity.id
+                        username_val = entity.username or username
+                        db.execute(
+                            "INSERT INTO senders (chat_id, username, balance) VALUES (?, ?, 0.0)",
+                            (chat_id, username_val)
+                        )
+                        db.execute("UPDATE senders SET balance = MAX(0.0, balance - ?) WHERE chat_id = ?", (amount, chat_id))
+                    else:
+                        await ctx.send(f"❌ Could not find a Telegram user with username **@{username}** in the database or Telegram lookup.")
+                        return
+                except Exception as lookup_err:
+                    print(f"Telethon lookup failed for {username}: {lookup_err}")
+                    await ctx.send(f"❌ Could not find a Telegram user with username **@{username}** in the database, and Telegram lookup failed.")
+                    return
             new_row = db.execute("SELECT balance FROM senders WHERE chat_id = ?", (chat_id,)).fetchone()
             
     new_bal = new_row["balance"] if new_row else 0.0
