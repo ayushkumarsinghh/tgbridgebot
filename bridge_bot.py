@@ -2183,6 +2183,142 @@ async def tg_message_handler(event):
         
         asyncio.create_task(wait_and_process_uploads(chat_id, now))
 
+# --- DATABASE BACKUP AND RESTORE ON DISCORD CHANNELS ---
+DB_WORKERS_CHANNEL_ID = 1521090428554842172
+DB_TG_BAL_CHANNEL_ID = 1521090483529584764
+
+db_restored = False
+db_sync_lock = asyncio.Lock()
+last_workers_json = ""
+last_senders_json = ""
+
+async def restore_db_from_discord():
+    global db_restored, last_workers_json, last_senders_json
+    if db_restored:
+        return
+    print("[DB Restore] Attempting to restore database tables from Discord channels...")
+    
+    # 1. Restore workers table
+    try:
+        workers_chan = await get_or_fetch_channel(DB_WORKERS_CHANNEL_ID)
+        if workers_chan:
+            async for message in workers_chan.history(limit=10):
+                if message.attachments:
+                    attachment = message.attachments[0]
+                    if attachment.filename.endswith(".json"):
+                        print(f"[DB Restore] Found workers backup file: {attachment.filename}")
+                        content_bytes = await attachment.read()
+                        data = json.loads(content_bytes.decode("utf-8"))
+                        with sqlite3.connect("sparky.db") as db:
+                            for row in data:
+                                db.execute(
+                                    "INSERT OR REPLACE INTO workers (user_id, username, balance) VALUES (?, ?, ?)",
+                                    (row["user_id"], row["username"], row["balance"])
+                                )
+                        last_workers_json = json.dumps(data, sort_keys=True)
+                        print(f"[DB Restore] Restored {len(data)} workers from Discord.")
+                        break
+    except Exception as e:
+        print(f"[DB Restore Error] Failed to restore workers: {e}")
+        
+    # 2. Restore senders table
+    try:
+        senders_chan = await get_or_fetch_channel(DB_TG_BAL_CHANNEL_ID)
+        if senders_chan:
+            async for message in senders_chan.history(limit=10):
+                if message.attachments:
+                    attachment = message.attachments[0]
+                    if attachment.filename.endswith(".json"):
+                        print(f"[DB Restore] Found senders backup file: {attachment.filename}")
+                        content_bytes = await attachment.read()
+                        data = json.loads(content_bytes.decode("utf-8"))
+                        with sqlite3.connect("sparky.db") as db:
+                            for row in data:
+                                db.execute(
+                                    "INSERT OR REPLACE INTO senders (chat_id, username, balance) VALUES (?, ?, ?)",
+                                    (row["chat_id"], row["username"], row["balance"])
+                                )
+                        last_senders_json = json.dumps(data, sort_keys=True)
+                        print(f"[DB Restore] Restored {len(data)} senders from Discord.")
+                        break
+    except Exception as e:
+        print(f"[DB Restore Error] Failed to restore senders: {e}")
+        
+    db_restored = True
+    print("[DB Restore] Database restoration process completed.")
+
+@tasks.loop(seconds=5)
+async def sync_db_to_discord():
+    global last_workers_json, last_senders_json, db_restored
+    if not db_restored:
+        return
+        
+    async with db_sync_lock:
+        # Sync workers
+        try:
+            with sqlite3.connect("sparky.db") as db:
+                db.row_factory = sqlite3.Row
+                rows = db.execute("SELECT user_id, username, balance FROM workers").fetchall()
+            workers_list = [{"user_id": r["user_id"], "username": r["username"], "balance": r["balance"]} for r in rows]
+            workers_json = json.dumps(workers_list, sort_keys=True)
+            
+            if workers_json != last_workers_json:
+                print("[DB Sync] Workers balance changed. Uploading backup to Discord...")
+                workers_chan = await get_or_fetch_channel(DB_WORKERS_CHANNEL_ID)
+                if workers_chan:
+                    temp_file = "workers_backup.json"
+                    with open(temp_file, "w", encoding="utf-8") as f:
+                        f.write(workers_json)
+                    
+                    file = discord.File(temp_file)
+                    await workers_chan.send(content=f"📦 **Workers Database Backup** | Synced at `{datetime.datetime.utcnow().isoformat()}`", file=file)
+                    try:
+                        os.remove(temp_file)
+                    except:
+                        pass
+                    last_workers_json = workers_json
+                    print("[DB Sync] Workers backup uploaded successfully.")
+        except Exception as e:
+            print(f"[DB Sync Error] Failed to sync workers: {e}")
+            
+        # Sync senders
+        try:
+            with sqlite3.connect("sparky.db") as db:
+                db.row_factory = sqlite3.Row
+                rows = db.execute("SELECT chat_id, username, balance FROM senders").fetchall()
+            senders_list = [{"chat_id": r["chat_id"], "username": r["username"], "balance": r["balance"]} for r in rows]
+            senders_json = json.dumps(senders_list, sort_keys=True)
+            
+            if senders_json != last_senders_json:
+                print("[DB Sync] Senders balance changed. Uploading backup to Discord...")
+                senders_chan = await get_or_fetch_channel(DB_TG_BAL_CHANNEL_ID)
+                if senders_chan:
+                    temp_file = "senders_backup.json"
+                    with open(temp_file, "w", encoding="utf-8") as f:
+                        f.write(senders_json)
+                    
+                    file = discord.File(temp_file)
+                    await senders_chan.send(content=f"📦 **Senders Database Backup** | Synced at `{datetime.datetime.utcnow().isoformat()}`", file=file)
+                    try:
+                        os.remove(temp_file)
+                    except:
+                        pass
+                    last_senders_json = senders_json
+                    print("[DB Sync] Senders backup uploaded successfully.")
+        except Exception as e:
+            print(f"[DB Sync Error] Failed to sync senders: {e}")
+
+@discord_bot.event
+async def on_ready():
+    print(f"[Discord Bot] Logged in and ready as: {discord_bot.user}")
+    
+    # Restore DB on boot
+    await restore_db_from_discord()
+    
+    # Start the sync loop if not already running
+    if not sync_db_to_discord.is_running():
+        sync_db_to_discord.start()
+
 # --- SERVICE RUNNER ---
 async def start_services():
     init_db()
