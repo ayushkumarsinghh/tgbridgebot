@@ -1266,7 +1266,7 @@ def is_admin_user(user_id, guild_perms=None):
         row = db.execute("SELECT 1 FROM allowed_admins WHERE user_id = ?", (user_id,)).fetchone()
     return row is not None
 
-@discord_bot.command(name="add")
+@discord_bot.command(name="add", aliases=["baladd", "addbal"])
 async def add_coins_cmd(ctx, member: discord.Member, amount: int):
     if not is_admin_user(ctx.author.id, ctx.author.guild_permissions):
         await ctx.send("❌ You do not have permission to run this command.")
@@ -1306,7 +1306,7 @@ async def add_coins_cmd(ctx, member: discord.Member, amount: int):
     except Exception as e:
         print(f"Error logging coin addition: {e}")
 
-@discord_bot.command(name="deduct")
+@discord_bot.command(name="deduct", aliases=["baldeduct", "deductbal"])
 async def deduct_coins_cmd(ctx, member: discord.Member, amount: int):
     if not is_admin_user(ctx.author.id, ctx.author.guild_permissions):
         await ctx.send("❌ You do not have permission to run this command.")
