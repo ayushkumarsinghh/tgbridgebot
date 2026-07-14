@@ -51,7 +51,7 @@ if os.path.exists(".env"):
 # --- CONFIGURATION ---
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "YOUR_DISCORD_BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "244415954782519296"))
-ADMIN_IDS = [170730211720167426]
+ADMIN_IDS = [170730211720167426, 1521398088248459424]
 DISCORD_GUILD_ID = int(os.getenv("DISCORD_GUILD_ID", "1520009752770379856"))
 DISCORD_PANEL_CHANNEL_ID = int(os.getenv("DISCORD_PANEL_CHANNEL_ID", "1520009753386815620"))
 DISCORD_CATEGORY_ID = int(os.getenv("DISCORD_CATEGORY_ID", "1520014399287590922"))
@@ -1002,18 +1002,19 @@ async def handle_individual_scanned(interaction: discord.Interaction, job_id: in
         pass
     
     if is_success:
-        # Credit worker 10 coins
+        # Credit worker dynamically based on scan_rate setting (defaults to 20)
+        scan_rate = get_setting("scan_rate", 20)
         with sqlite3.connect("sparky.db") as db:
             db.execute(
-                "INSERT INTO workers (user_id, username, balance) VALUES (?, ?, 10) ON CONFLICT(user_id) DO UPDATE SET balance = balance + 10",
-                (interaction.user.id, str(interaction.user),)
+                "INSERT INTO workers (user_id, username, balance) VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET balance = balance + ?",
+                (interaction.user.id, str(interaction.user), scan_rate, scan_rate)
             )
             db.execute("UPDATE jobs SET status = 'success' WHERE job_id = ?", (job_id,))
             
             # Retrieve new balance
             db.row_factory = sqlite3.Row
             row = db.execute("SELECT balance FROM workers WHERE user_id = ?", (interaction.user.id,)).fetchone()
-            new_bal = row["balance"] if row else 10
+            new_bal = row["balance"] if row else scan_rate
 
         # Log to hardcoded channel 1520019495626735718
         try:
@@ -1024,7 +1025,7 @@ async def handle_individual_scanned(interaction: discord.Interaction, job_id: in
                     description=(
                         f"**Worker**: {interaction.user.mention} (ID: `{interaction.user.id}`)\n"
                         f"**Job ID**: `{job_id}`\n"
-                        f"**Amount**: `+10 coins`\n"
+                        f"**Amount**: `+{scan_rate} coins`\n"
                         f"**New Balance**: `{new_bal} coins`"
                     ),
                     color=discord.Color.green(),
@@ -1078,10 +1079,10 @@ async def handle_individual_scanned(interaction: discord.Interaction, job_id: in
         # Edit the message to show Verified status and remove/disable the button
         embed = interaction.message.embeds[0]
         embed.color = discord.Color.green()
-        embed.add_field(name="Status", value="✅ Verified & Paid (10 coins credited)", inline=False)
+        embed.add_field(name="Status", value=f"✅ Verified & Paid ({scan_rate} coins credited)", inline=False)
         await interaction.message.edit(embed=embed, view=None)
         
-        await interaction.channel.send(f"🎉 **Job #{job_id} Verified!** 10 coins added to your balance.")
+        await interaction.channel.send(f"🎉 **Job #{job_id} Verified!** {scan_rate} coins added to your balance.")
         
         # Check if all jobs in this panel are now completed (success or failed)
         with sqlite3.connect("sparky.db") as db:
@@ -1676,6 +1677,20 @@ async def withdrawminset_cmd(ctx, amount: int):
     await ctx.send(f"✅ Minimum withdrawal limit has been set to **{amount} coins**.")
 
 
+@discord_bot.command(name="setscanrate")
+async def setscanrate_cmd(ctx, amount: int):
+    if not is_admin_user(ctx.author.id, ctx.author.guild_permissions):
+        await ctx.send("❌ You do not have permission to run this command.")
+        return
+        
+    if amount <= 0:
+        await ctx.send("❌ Scan rate must be greater than zero.")
+        return
+        
+    set_setting("scan_rate", amount)
+    await ctx.send(f"✅ Successful scan payout rate has been set to **{amount} coins**.")
+
+
 @discord_bot.command(name="jobs", aliases=["active"])
 async def active_jobs_cmd(ctx):
     if not is_admin_user(ctx.author.id, ctx.author.guild_permissions):
@@ -1746,11 +1761,12 @@ async def wait_and_process_uploads(chat_id: int, target_time: float):
                     )
 
             # Post the Job Panel Card on Discord
+            scan_rate = get_setting("scan_rate", 20)
             panel_channel = await get_or_fetch_channel(DISCORD_PANEL_CHANNEL_ID)
             if panel_channel:
                 embed = discord.Embed(
                     title="New Job Panel Available!",
-                    description=f"**Panel ID**: {panel_id}\nContains: **{len(chunk)} QRs**\nPayout: **10 Coins per QR**",
+                    description=f"**Panel ID**: {panel_id}\nContains: **{len(chunk)} QRs**\nPayout: **{scan_rate} Coins per QR**",
                     color=discord.Color.purple()
                 )
                 view = discord.ui.View(timeout=None)
