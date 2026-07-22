@@ -196,6 +196,12 @@ def init_db():
             conn.execute("ALTER TABLE panels ADD COLUMN created_at REAL;")
         except sqlite3.OperationalError:
             pass
+            
+        # Add failed_count column if workers table exists but doesn't have it
+        try:
+            conn.execute("ALTER TABLE workers ADD COLUMN failed_count INTEGER DEFAULT 0;")
+        except sqlite3.OperationalError:
+            pass
         conn.execute("""
             CREATE TABLE IF NOT EXISTS jobs (
                 job_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -586,6 +592,65 @@ class DiscordApprovalView(discord.ui.View):
             view=None
         )
 
+async def increment_worker_fail(worker_id: int, username: str = None, reason: str = "Job/Panel Failure"):
+    if not username:
+        try:
+            guild = await get_or_fetch_guild(DISCORD_GUILD_ID)
+            if guild:
+                m = await guild.fetch_member(worker_id)
+                if m:
+                    username = str(m)
+        except:
+            username = f"Worker-{worker_id}"
+            
+    fail_penalty = get_setting("fail_penalty", 50)
+    
+    with sqlite3.connect("sparky.db") as db:
+        db.execute(
+            "INSERT INTO workers (user_id, username, balance, failed_count) VALUES (?, ?, 0, 1) ON CONFLICT(user_id) DO UPDATE SET failed_count = failed_count + 1",
+            (worker_id, username)
+        )
+        db.row_factory = sqlite3.Row
+        row = db.execute("SELECT balance, failed_count FROM workers WHERE user_id = ?", (worker_id,)).fetchone()
+        
+    current_fails = row["failed_count"] if row else 1
+    current_bal = row["balance"] if row else 0
+    penalty_applied = False
+    new_bal = current_bal
+
+    if current_fails >= 5:
+        penalty_applied = True
+        with sqlite3.connect("sparky.db") as db:
+            db.execute(
+                "UPDATE workers SET balance = MAX(0, balance - ?), failed_count = 0 WHERE user_id = ?",
+                (fail_penalty, worker_id)
+            )
+            db.row_factory = sqlite3.Row
+            row2 = db.execute("SELECT balance FROM workers WHERE user_id = ?", (worker_id,)).fetchone()
+            new_bal = row2["balance"] if row2 else 0
+
+        # Log penalty deduction to Discord channel 1520019495626735718
+        try:
+            coin_log_channel = await get_or_fetch_channel(1520019495626735718)
+            if coin_log_channel:
+                coin_embed = discord.Embed(
+                    title="⚠️ 5-Failure Penalty Deduction (-50 coins/rs)",
+                    description=(
+                        f"**Worker**: <@{worker_id}> (ID: `{worker_id}`)\n"
+                        f"**Reason**: Reached 5 accumulated job/panel failures ({reason})\n"
+                        f"**Penalty Deducted**: `-{fail_penalty} coins/rs`\n"
+                        f"**New Balance**: `{new_bal} coins`\n"
+                        f"**Failure Counter**: Reset to `0/5`"
+                    ),
+                    color=discord.Color.red(),
+                    timestamp=datetime.datetime.utcnow()
+                )
+                await coin_log_channel.send(embed=coin_embed)
+        except Exception as e:
+            print(f"Error logging failure penalty deduction: {e}")
+            
+    return current_fails, penalty_applied, new_bal
+
 # --- PENALTY & TIMEOUT ENGINE ---
 async def handle_panel_failure(panel_id: int, worker_id: int, channel_id: int, reason: str, deduct_penalty: bool = True):
     # Fetch panel info
@@ -596,14 +661,15 @@ async def handle_panel_failure(panel_id: int, worker_id: int, channel_id: int, r
     if not panel or panel["status"] != "claimed":
         return
 
-    # Deduct 20 coins if penalty applies
+    # Deduct 20 coins & increment failure counter if penalty applies
     if deduct_penalty:
+        current_fails, penalty_applied, new_bal = await increment_worker_fail(worker_id, reason=reason)
+        
         with sqlite3.connect("sparky.db") as db:
             db.execute(
-                "INSERT INTO workers (user_id, balance) VALUES (?, 0) ON CONFLICT(user_id) DO UPDATE SET balance = MAX(0, balance - 20)",
+                "UPDATE workers SET balance = MAX(0, balance - 20) WHERE user_id = ?",
                 (worker_id,)
             )
-            # Retrieve new balance
             db.row_factory = sqlite3.Row
             row = db.execute("SELECT balance FROM workers WHERE user_id = ?", (worker_id,)).fetchone()
             new_bal = row["balance"] if row else 0
@@ -619,6 +685,7 @@ async def handle_panel_failure(panel_id: int, worker_id: int, channel_id: int, r
                         f"**Panel ID**: `{panel_id}`\n"
                         f"**Reason**: {reason}\n"
                         f"**Amount**: `-20 coins`\n"
+                        f"**Fail Counter**: `{current_fails}/5`\n"
                         f"**New Balance**: `{new_bal} coins`"
                     ),
                     color=discord.Color.red(),
@@ -937,6 +1004,210 @@ async def handle_panel_claim(interaction: discord.Interaction, panel_id: int):
 
     await interaction.followup.send(f"Job claimed! Please head to your private channel: {private_channel.mention}", ephemeral=True)
 
+async def finalize_job_success(job_id: int, worker_id: int, message_obj: discord.Message = None, channel_obj: discord.TextChannel = None) -> bool:
+    with sqlite3.connect("sparky.db") as db:
+        # Atomic status update to avoid duplicate payouts between manual button & auto loop
+        cur = db.execute("UPDATE jobs SET status = 'success' WHERE job_id = ? AND status = 'available'", (job_id,))
+        if cur.rowcount == 0:
+            return False
+        
+        db.row_factory = sqlite3.Row
+        job = db.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+        
+    if not job:
+        return False
+        
+    panel_id = job["panel_id"]
+    scan_rate = get_setting("scan_rate", 20)
+    
+    # Fetch worker username if possible
+    worker_username = f"Worker-{worker_id}"
+    try:
+        guild = await get_or_fetch_guild(DISCORD_GUILD_ID)
+        if guild:
+            member = await guild.fetch_member(worker_id)
+            if member:
+                worker_username = str(member)
+    except:
+        pass
+    
+    # 1. Update worker balance and mark panel action taken
+    with sqlite3.connect("sparky.db") as db:
+        db.execute(
+            "INSERT INTO workers (user_id, username, balance) VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET balance = balance + ?",
+            (worker_id, worker_username, scan_rate, scan_rate)
+        )
+        db.execute("UPDATE panels SET action_taken = 1 WHERE panel_id = ?", (panel_id,))
+        
+        db.row_factory = sqlite3.Row
+        row = db.execute("SELECT balance FROM workers WHERE user_id = ?", (worker_id,)).fetchone()
+        new_bal = row["balance"] if row else scan_rate
+
+    # 2. Log coin credit to Discord channel 1520019495626735718
+    try:
+        coin_log_channel = await get_or_fetch_channel(1520019495626735718)
+        if coin_log_channel:
+            coin_embed = discord.Embed(
+                title="🪙 Stripe Payment Auto-Verified Coin Credit",
+                description=(
+                    f"**Worker**: <@{worker_id}> (ID: `{worker_id}`)\n"
+                    f"**Job ID**: `{job_id}`\n"
+                    f"**Amount**: `+{scan_rate} coins`\n"
+                    f"**New Balance**: `{new_bal} coins`"
+                ),
+                color=discord.Color.green(),
+                timestamp=datetime.datetime.utcnow()
+            )
+            await coin_log_channel.send(embed=coin_embed)
+    except Exception as e:
+        print(f"Error logging QR scanned coin credit: {e}")
+
+    # 3. Reply Success on Telegram to the seller
+    try:
+        success_caption = f"Success\n{job['stripe_url']}"
+        if job["qr_file_path"] and os.path.exists(job["qr_file_path"]) and os.path.getsize(job["qr_file_path"]) > 0:
+            await bot_client.send_file(
+                job["tg_chat_id"],
+                job["qr_file_path"],
+                caption=success_caption,
+                reply_to=job["tg_msg_id"]
+            )
+        else:
+            await bot_client.send_message(
+                job["tg_chat_id"], 
+                success_caption, 
+                reply_to=job["tg_msg_id"]
+            )
+    except Exception as e:
+        print(f"Error replying success to TG seller: {e}")
+
+    # 4. Log to verification channel 1520104064875237407
+    try:
+        log_channel_id = 1520104064875237407
+        log_channel = await get_or_fetch_channel(log_channel_id)
+        if log_channel:
+            log_embed = discord.Embed(
+                title="QR / Stripe Link Auto-Verified",
+                description=f"**Worker**: <@{worker_id}> (ID: {worker_id})\n**Stripe Link**: {job['stripe_url']}",
+                color=discord.Color.green(),
+                timestamp=discord.utils.utcnow()
+            )
+            if job["qr_file_path"] and os.path.exists(job["qr_file_path"]) and os.path.getsize(job["qr_file_path"]) > 0:
+                file_to_send = discord.File(job["qr_file_path"], filename="qr.png")
+                log_embed.set_image(url="attachment://qr.png")
+                await log_channel.send(file=file_to_send, embed=log_embed)
+            else:
+                await log_channel.send(embed=log_embed)
+    except Exception as log_err:
+        print(f"Error logging scanned job to channel: {log_err}")
+
+    # 5. Update Discord message / channel UI if available
+    if channel_obj is None and message_obj is not None:
+        channel_obj = message_obj.channel
+        
+    if message_obj:
+        try:
+            embed = message_obj.embeds[0]
+            embed.color = discord.Color.green()
+            embed.add_field(name="Status", value=f"✅ Verified & Paid ({scan_rate} coins credited)", inline=False)
+            await message_obj.edit(embed=embed, view=None)
+        except Exception as edit_err:
+            print(f"Error editing message embed: {edit_err}")
+            
+    if channel_obj:
+        try:
+            await channel_obj.send(f"🎉 **Job #{job_id} Verified!** {scan_rate} coins added to <@{worker_id}> balance.")
+        except Exception:
+            pass
+
+    # 6. Check if all jobs in panel are completed
+    with sqlite3.connect("sparky.db") as db:
+        db.row_factory = sqlite3.Row
+        total_jobs = db.execute("SELECT COUNT(*) FROM jobs WHERE panel_id = ?", (panel_id,)).fetchone()[0]
+        completed_jobs = db.execute("SELECT COUNT(*) FROM jobs WHERE panel_id = ? AND status IN ('success', 'failed')", (panel_id,)).fetchone()[0]
+
+    if completed_jobs >= total_jobs:
+        with sqlite3.connect("sparky.db") as db:
+            db.execute("UPDATE panels SET status = 'success' WHERE panel_id = ?", (panel_id,))
+
+        try:
+            log_channel = await get_or_fetch_channel(DISCORD_LOG_CHANNEL_ID)
+            if log_channel:
+                log_embed = discord.Embed(
+                    title="Job Closed",
+                    description=f"Panel ID: {panel_id}\nStatus: **Completed**\nWorker: <@{worker_id}>",
+                    color=discord.Color.green()
+                )
+                await log_channel.send(embed=log_embed)
+        except Exception as e:
+            print(f"Error sending log message: {e}")
+
+        if channel_obj:
+            try:
+                await channel_obj.send("🎉 **All payments in this panel have been completed or failed!** Channel will delete in 5 seconds...")
+                await asyncio.sleep(5)
+                await channel_obj.delete(reason="Panel completed successfully")
+            except Exception as e:
+                print(f"[Error] Failed to delete completed channel: {e}")
+
+        # Cleanup QR files
+        with sqlite3.connect("sparky.db") as db:
+            db.row_factory = sqlite3.Row
+            jobs_in_panel = db.execute("SELECT * FROM jobs WHERE panel_id = ?", (panel_id,)).fetchall()
+        for j in jobs_in_panel:
+            if os.path.exists(j["qr_file_path"]):
+                try:
+                    os.remove(j["qr_file_path"])
+                except:
+                    pass
+
+    return True
+
+@tasks.loop(seconds=5)
+async def auto_verify_stripe_jobs():
+    with sqlite3.connect("sparky.db") as db:
+        db.row_factory = sqlite3.Row
+        active_jobs = db.execute("""
+            SELECT j.*, p.worker_id, p.discord_channel_id 
+            FROM jobs j 
+            JOIN panels p ON j.panel_id = p.panel_id 
+            WHERE p.status = 'claimed' AND j.status = 'available'
+        """).fetchall()
+
+    for job in active_jobs:
+        try:
+            is_success = await asyncio.to_thread(verify_stripe_payment, job["stripe_url"])
+            if is_success:
+                print(f"[Auto Stripe Verifier] Payment succeeded for Job #{job['job_id']}! Auto-crediting worker {job['worker_id']}...")
+                
+                channel_obj = None
+                message_obj = None
+                if job["discord_channel_id"]:
+                    channel_obj = await get_or_fetch_channel(job["discord_channel_id"])
+                    if channel_obj:
+                        try:
+                            async for msg in channel_obj.history(limit=50):
+                                if msg.embeds:
+                                    for emb in msg.embeds:
+                                        if f"Job ID: {job['job_id']}" in (emb.title or ""):
+                                            message_obj = msg
+                                            break
+                                if message_obj:
+                                    break
+                        except Exception as history_err:
+                            print(f"[Auto Verifier] Error fetching history: {history_err}")
+                
+                await finalize_job_success(
+                    job_id=job["job_id"],
+                    worker_id=job["worker_id"],
+                    message_obj=message_obj,
+                    channel_obj=channel_obj
+                )
+        except Exception as err:
+            print(f"[Auto Verifier Error] Failed checking Job #{job['job_id']}: {err}")
+        
+        await asyncio.sleep(0.5)
+
 async def handle_individual_scanned(interaction: discord.Interaction, job_id: int):
     await interaction.response.defer()
     
@@ -1002,131 +1273,12 @@ async def handle_individual_scanned(interaction: discord.Interaction, job_id: in
         pass
     
     if is_success:
-        # Credit worker dynamically based on scan_rate setting (defaults to 20)
-        scan_rate = get_setting("scan_rate", 20)
-        with sqlite3.connect("sparky.db") as db:
-            db.execute(
-                "INSERT INTO workers (user_id, username, balance) VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET balance = balance + ?",
-                (interaction.user.id, str(interaction.user), scan_rate, scan_rate)
-            )
-            db.execute("UPDATE jobs SET status = 'success' WHERE job_id = ?", (job_id,))
-            
-            # Retrieve new balance
-            db.row_factory = sqlite3.Row
-            row = db.execute("SELECT balance FROM workers WHERE user_id = ?", (interaction.user.id,)).fetchone()
-            new_bal = row["balance"] if row else scan_rate
-
-        # Log to hardcoded channel 1520019495626735718
-        try:
-            coin_log_channel = await get_or_fetch_channel(1520019495626735718)
-            if coin_log_channel:
-                coin_embed = discord.Embed(
-                    title="🪙 QR Scanned Coin Credit",
-                    description=(
-                        f"**Worker**: {interaction.user.mention} (ID: `{interaction.user.id}`)\n"
-                        f"**Job ID**: `{job_id}`\n"
-                        f"**Amount**: `+{scan_rate} coins`\n"
-                        f"**New Balance**: `{new_bal} coins`"
-                    ),
-                    color=discord.Color.green(),
-                    timestamp=datetime.datetime.utcnow()
-                )
-                await coin_log_channel.send(embed=coin_embed)
-        except Exception as e:
-            print(f"Error logging QR scanned coin credit: {e}")
-            
-        # Reply Success on Telegram, replying the stripe link / qr
-        try:
-            success_caption = f"Success\n{job['stripe_url']}"
-            if job["qr_file_path"] and os.path.exists(job["qr_file_path"]) and os.path.getsize(job["qr_file_path"]) > 0:
-                await bot_client.send_file(
-                    job["tg_chat_id"],
-                    job["qr_file_path"],
-                    caption=success_caption,
-                    reply_to=job["tg_msg_id"]
-                )
-            else:
-                await bot_client.send_message(
-                    job["tg_chat_id"], 
-                    success_caption, 
-                    reply_to=job["tg_msg_id"]
-                )
-        except Exception as e:
-            print(f"Error replying success to TG seller: {e}")
-
-        # Log every scanned QR / link with the person who clicked scanned button to channel 1520104064875237407
-        try:
-            log_channel_id = 1520104064875237407
-            log_channel = await get_or_fetch_channel(log_channel_id)
-            if log_channel:
-                log_embed = discord.Embed(
-                    title="QR / Stripe Link Verified",
-                    description=f"**Worker**: {interaction.user.mention} (ID: {interaction.user.id})\n**Stripe Link**: {job['stripe_url']}",
-                    color=discord.Color.green(),
-                    timestamp=discord.utils.utcnow()
-                )
-                if job["qr_file_path"] and os.path.exists(job["qr_file_path"]) and os.path.getsize(job["qr_file_path"]) > 0:
-                    file_to_send = discord.File(job["qr_file_path"], filename="qr.png")
-                    log_embed.set_image(url="attachment://qr.png")
-                    await log_channel.send(file=file_to_send, embed=log_embed)
-                else:
-                    await log_channel.send(embed=log_embed)
-            else:
-                print(f"[Error] Log channel {log_channel_id} not found or could not be fetched.")
-        except Exception as log_err:
-            print(f"Error logging scanned job to channel {log_channel_id}: {log_err}")
-            
-        # Edit the message to show Verified status and remove/disable the button
-        embed = interaction.message.embeds[0]
-        embed.color = discord.Color.green()
-        embed.add_field(name="Status", value=f"✅ Verified & Paid ({scan_rate} coins credited)", inline=False)
-        await interaction.message.edit(embed=embed, view=None)
-        
-        await interaction.channel.send(f"🎉 **Job #{job_id} Verified!** {scan_rate} coins added to your balance.")
-        
-        # Check if all jobs in this panel are now completed (success or failed)
-        with sqlite3.connect("sparky.db") as db:
-            db.row_factory = sqlite3.Row
-            total_jobs = db.execute("SELECT COUNT(*) FROM jobs WHERE panel_id = ?", (panel_id,)).fetchone()[0]
-            completed_jobs = db.execute("SELECT COUNT(*) FROM jobs WHERE panel_id = ? AND status IN ('success', 'failed')", (panel_id,)).fetchone()[0]
-            
-        if completed_jobs >= total_jobs:
-            # Mark panel as success
-            with sqlite3.connect("sparky.db") as db:
-                db.execute("UPDATE panels SET status = 'success' WHERE panel_id = ?", (panel_id,))
-                
-            # Send Log to Log Channel
-            try:
-                log_channel = await get_or_fetch_channel(DISCORD_LOG_CHANNEL_ID)
-                if log_channel:
-                    log_embed = discord.Embed(
-                        title="Job Closed",
-                        description=f"Panel ID: {panel_id}\nStatus: **Completed**\nWorker: {interaction.user.mention}",
-                        color=discord.Color.green()
-                    )
-                    await log_channel.send(embed=log_embed)
-            except Exception as e:
-                print(f"Error sending log message: {e}")
-                
-            await interaction.channel.send("🎉 **All payments in this panel have been completed or failed!** Channel will delete in 5 seconds...")
-            await asyncio.sleep(5)
-            
-            # Delete channel
-            try:
-                await interaction.channel.delete(reason="Panel completed successfully")
-            except Exception as e:
-                print(f"[Error] Failed to delete completed channel: {e}")
-                
-            # Cleanup QR files
-            with sqlite3.connect("sparky.db") as db:
-                db.row_factory = sqlite3.Row
-                jobs_in_panel = db.execute("SELECT * FROM jobs WHERE panel_id = ?", (panel_id,)).fetchall()
-            for j in jobs_in_panel:
-                if os.path.exists(j["qr_file_path"]):
-                    try:
-                        os.remove(j["qr_file_path"])
-                    except:
-                        pass
+        await finalize_job_success(
+            job_id=job_id,
+            worker_id=interaction.user.id,
+            message_obj=interaction.message,
+            channel_obj=interaction.channel
+        )
     else:
         # Update job status to 'failed' in DB
         with sqlite3.connect("sparky.db") as db:
@@ -1719,6 +1871,116 @@ async def active_jobs_cmd(ctx):
             msg_lines.append(f"• Panel #{panel['panel_id']} ({jobs_count} QRs) claimed by {worker_mention} ({claimed_duration}s ago)")
             
     await ctx.send("\n".join(msg_lines))
+
+# --- FAILURE COUNTER & FORCE CLOSE COMMANDS ---
+@discord_bot.command(name="fails", aliases=["checkfails"])
+async def check_fails_cmd(ctx, member: discord.Member = None):
+    target = member or ctx.author
+    with sqlite3.connect("sparky.db") as db:
+        db.row_factory = sqlite3.Row
+        row = db.execute("SELECT failed_count FROM workers WHERE user_id = ?", (target.id,)).fetchone()
+    
+    fails = row["failed_count"] if (row and "failed_count" in row.keys()) else 0
+    penalty = get_setting("fail_penalty", 50)
+    await ctx.send(f"⚠️ {target.mention} currently has **{fails}/5 failed attempts**. (At 5 fails, a penalty of {penalty} coins/rs is automatically deducted).")
+
+@discord_bot.command(name="resetfails")
+async def reset_fails_cmd(ctx, member: discord.Member):
+    if not is_admin_user(ctx.author.id, ctx.author.guild_permissions):
+        await ctx.send("❌ You do not have permission to run this command.")
+        return
+        
+    with sqlite3.connect("sparky.db") as db:
+        db.execute("UPDATE workers SET failed_count = 0 WHERE user_id = ?", (member.id,))
+    await ctx.send(f"✅ Reset failure counter for {member.mention} back to **0/5**.")
+
+@discord_bot.command(name="addfail")
+async def add_fail_cmd(ctx, member: discord.Member, reason: str = "Manual admin fail"):
+    if not is_admin_user(ctx.author.id, ctx.author.guild_permissions):
+        await ctx.send("❌ You do not have permission to run this command.")
+        return
+        
+    current_fails, penalty_applied, new_bal = await increment_worker_fail(member.id, str(member), reason=reason)
+    if penalty_applied:
+        await ctx.send(f"⚠️ Added failure to {member.mention}. Reached **5/5 fails**! Penalty of 50 coins/rs deducted. New balance: **{new_bal} coins**.")
+    else:
+        await ctx.send(f"⚠️ Added failure to {member.mention}. Failure count is now **{current_fails}/5**.")
+
+@discord_bot.command(name="setfailpenalty")
+async def set_fail_penalty_cmd(ctx, amount: int):
+    if not is_admin_user(ctx.author.id, ctx.author.guild_permissions):
+        await ctx.send("❌ You do not have permission to run this command.")
+        return
+    if amount < 0:
+        await ctx.send("❌ Penalty amount cannot be negative.")
+        return
+    set_setting("fail_penalty", amount)
+    await ctx.send(f"✅ Set 5-failure penalty amount to **{amount} coins/rs**.")
+
+@discord_bot.command(name="forceclose", aliases=["closejob", "canceljob", "clearjob"])
+async def force_close_cmd(ctx, target: str = ""):
+    """Removes active claimed jobs/panels so workers can claim new ones."""
+    if not is_admin_user(ctx.author.id, ctx.author.guild_permissions):
+        await ctx.send("❌ You do not have permission to run this command.")
+        return
+
+    if not target:
+        await ctx.send("Usage: `!forceclose @worker` or `!forceclose <panel_id>` or `!forceclose all`")
+        return
+
+    target = target.strip()
+    
+    if target.lower() == "all":
+        with sqlite3.connect("sparky.db") as db:
+            db.row_factory = sqlite3.Row
+            panels = db.execute("SELECT * FROM panels WHERE status = 'claimed'").fetchall()
+
+        if not panels:
+            await ctx.send("No active claimed panels found.")
+            return
+
+        count = 0
+        for p in panels:
+            await handle_panel_failure(p["panel_id"], p["worker_id"], p["discord_channel_id"], reason="Admin force closed panel", deduct_penalty=False)
+            count += 1
+            
+        await ctx.send(f"✅ Force closed **{count}** active panel(s). All affected workers can now claim new channels.")
+        return
+
+    # Check if target is a panel ID
+    if target.isdigit():
+        panel_id = int(target)
+        with sqlite3.connect("sparky.db") as db:
+            db.row_factory = sqlite3.Row
+            panel = db.execute("SELECT * FROM panels WHERE panel_id = ? AND status = 'claimed'", (panel_id,)).fetchone()
+
+        if not panel:
+            await ctx.send(f"❌ Claimed panel ID `{panel_id}` not found.")
+            return
+
+        await handle_panel_failure(panel["panel_id"], panel["worker_id"], panel["discord_channel_id"], reason="Admin force closed panel", deduct_penalty=False)
+        await ctx.send(f"✅ Force closed panel ID `{panel_id}`. Worker <@{panel['worker_id']}> is now unblocked.")
+        return
+
+    # Check if target is a member mention / user ID
+    match = re.search(r'\d+', target)
+    if match:
+        user_id = int(match.group(0))
+        with sqlite3.connect("sparky.db") as db:
+            db.row_factory = sqlite3.Row
+            panels = db.execute("SELECT * FROM panels WHERE worker_id = ? AND status = 'claimed'", (user_id,)).fetchall()
+
+        if not panels:
+            await ctx.send(f"❌ No active claimed panels found for worker <@{user_id}>.")
+            return
+
+        for p in panels:
+            await handle_panel_failure(p["panel_id"], p["worker_id"], p["discord_channel_id"], reason="Admin force closed panel", deduct_penalty=False)
+
+        await ctx.send(f"✅ Force closed active panel(s) for worker <@{user_id}>. Worker can now claim a new channel.")
+        return
+
+    await ctx.send("❌ Invalid target. Please specify `@worker`, `<panel_id>`, or `all`.")
 
 # --- UPLOAD TIMEOUT PROCESSOR ---
 async def wait_and_process_uploads(chat_id: int, target_time: float):
@@ -2346,8 +2608,9 @@ async def start_services():
     print("[Discord Bot] Starting background task...")
     asyncio.create_task(discord_bot.start(DISCORD_TOKEN))
     
-    # Start Discord presence monitor loop
+    # Start Discord presence monitor loop & auto Stripe verifier loop
     monitor_claimed_panels.start()
+    auto_verify_stripe_jobs.start()
 
     # Keep bot telegram loop alive
     await bot_client.run_until_disconnected()
