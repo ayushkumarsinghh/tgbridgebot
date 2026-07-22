@@ -537,12 +537,19 @@ def verify_stripe_payment(url: str) -> bool:
             except Exception as init_err:
                 print(f"[Warning] Init query failed for {cs_id}: {init_err}")
 
-        # 3. Check data-message attribute fallback (for custom instruction pages)
+        # 3. Check data-message attribute fallback (for custom instruction pages like payments.stripe.com/upi/instructions/...)
         data_match = re.search(r'data-message="([^"]+)"', html)
         if data_match:
             try:
                 decoded = base64.b64decode(data_match.group(1)).decode("utf-8")
                 payload = json.loads(decoded)
+                
+                # Check direct payload fields
+                intent_state = payload.get("intent_state")
+                p_status = payload.get("status") or payload.get("payment_intent_status")
+                if intent_state == "succeeded" or p_status in ["succeeded", "complete"]:
+                    print(f"[+] Verified UPI instruction page payload state: intent_state={intent_state}, status={p_status}")
+                    return True
                 
                 client_secret = payload.get("client_secret")
                 publishable_key = payload.get("publishable_key")
