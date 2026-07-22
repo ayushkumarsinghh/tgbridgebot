@@ -459,77 +459,122 @@ def verify_stripe_payment(url: str) -> bool:
     import urllib.parse
     import urllib.request
     import json
-    
-    # 1. First extract client_secret and publishable_key from the instruction page HTML
+    import re
+    import tls_client
+
+    if not url:
+        return False
+
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
     }
-    
-    # We use tls_client to fetch the page so we bypass any simple TLS blocking
+
     session = tls_client.Session(client_identifier="chrome_120", random_tls_extension_order=True)
     proxy = get_proxy_url()
     if proxy:
         session.proxies = {"http": proxy, "https": proxy}
-        
+
     try:
-        print(f"[Stripe Query] Fetching Stripe instructions page: {url}")
-        r = session.get(url, headers=headers, timeout_seconds=10)
+        print(f"[Stripe Query] Fetching Stripe page: {url}")
+        r = session.get(url, headers=headers, timeout_seconds=12)
         if r.status_code != 200:
-            print(f"[-] Stripe verification page request failed with status code {r.status_code}")
+            print(f"[-] Page request returned status code {r.status_code}")
             return False
-            
+
         html = r.text
-        match = re.search(r'data-message="([^"]+)"', html)
-        if not match:
-            print("[-] data-message attribute not found in HTML.")
-            # Fallback check
-            if "Action Successful" in html:
-                print("[+] Stripe page explicitly has 'Action Successful' in static text.")
+
+        # 1. Direct text/JSON indicators on success or completed page
+        success_indicators = [
+            "Action Successful",
+            "Payment successful",
+            "Thank you for your payment",
+            "Payment Succeeded",
+            "payment_status\":\"paid\"",
+            "\"status\":\"complete\"",
+            "\"status\":\"succeeded\"",
+            "\"state\":\"succeeded\"",
+            "\"payment_intent_status\":\"succeeded\""
+        ]
+        
+        for indicator in success_indicators:
+            if indicator.lower() in html.lower():
+                print(f"[+] Stripe payment verified via success indicator: '{indicator}'")
                 return True
-            return False
+
+        # 2. Extract Checkout Session ID if present (cs_live_... or cs_test_...)
+        cs_match = re.search(r'(cs_(?:live|test)_[a-zA-Z0-9]+)', url)
+        if not cs_match:
+            cs_match = re.search(r'(cs_(?:live|test)_[a-zA-Z0-9]+)', html)
+
+        if cs_match:
+            cs_id = cs_match.group(1)
+            print(f"[Stripe Query] Extracted Checkout Session ID: {cs_id}")
             
-        decoded = base64.b64decode(match.group(1)).decode("utf-8")
-        payload = json.loads(decoded)
-        
-        client_secret = payload.get("client_secret")
-        publishable_key = payload.get("publishable_key")
-        
-        if not client_secret or not publishable_key:
-            print("[-] Missing client_secret or publishable_key in payload.")
-            return False
+            init_url = f"https://api.stripe.com/v1/payment_pages/{cs_id}/init"
+            init_headers = {
+                "User-Agent": headers["User-Agent"],
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+                "Origin": "https://js.stripe.com"
+            }
+            pk_match = re.search(r'(pk_(?:live|test)_[a-zA-Z0-9]+)', html)
+            pk = pk_match.group(1) if pk_match else "pk_live_51M08iiC314159..."
             
-        # Extract intent ID
-        intent_id = client_secret.split("_secret_")[0]
-        
-        # Build Stripe API query URL
-        if client_secret.startswith("seti_"):
-            api_url = f"https://api.stripe.com/v1/setup_intents/{intent_id}"
-        elif client_secret.startswith("pi_"):
-            api_url = f"https://api.stripe.com/v1/payment_intents/{intent_id}"
-        else:
-            print(f"[-] Unknown intent type prefix: {client_secret}")
-            return False
-            
-        params = {
-            "key": publishable_key,
-            "client_secret": client_secret,
-            "is_stripe_sdk": "true"
-        }
-        api_url = f"{api_url}?{urllib.parse.urlencode(params)}"
-        print(f"[Stripe Query] Querying public API endpoint: {api_url}")
-        
-        api_res = session.get(api_url, headers=headers, timeout_seconds=10)
-        if api_res.status_code == 200:
-            res_data = api_res.json()
-            status = res_data.get("status")
-            print(f"[Stripe Query] Intent status for {url}: {status}")
-            return status == "succeeded"
-        else:
-            print(f"[-] Stripe API query returned status code {api_res.status_code}")
-            
+            init_data = f"key={pk}&_stripe_version=2024-04-10"
+            try:
+                init_res = session.post(init_url, headers=init_headers, data=init_data, timeout_seconds=10)
+                if init_res.status_code == 200:
+                    data = init_res.json()
+                    status = data.get("status") or (data.get("session") or {}).get("status") or (data.get("payment_intent") or {}).get("status")
+                    payment_status = (data.get("session") or {}).get("payment_status") or data.get("payment_status")
+                    
+                    print(f"[Stripe Query] CS {cs_id} status: {status} | payment_status: {payment_status}")
+                    if status in ["complete", "succeeded"] or payment_status == "paid":
+                        print(f"[+] Verified Stripe Checkout Session {cs_id} is COMPLETE/PAID!")
+                        return True
+            except Exception as init_err:
+                print(f"[Warning] Init query failed for {cs_id}: {init_err}")
+
+        # 3. Check data-message attribute fallback (for custom instruction pages)
+        data_match = re.search(r'data-message="([^"]+)"', html)
+        if data_match:
+            try:
+                decoded = base64.b64decode(data_match.group(1)).decode("utf-8")
+                payload = json.loads(decoded)
+                
+                client_secret = payload.get("client_secret")
+                publishable_key = payload.get("publishable_key")
+                
+                if client_secret and publishable_key:
+                    intent_id = client_secret.split("_secret_")[0]
+                    if client_secret.startswith("seti_"):
+                        api_url = f"https://api.stripe.com/v1/setup_intents/{intent_id}"
+                    elif client_secret.startswith("pi_"):
+                        api_url = f"https://api.stripe.com/v1/payment_intents/{intent_id}"
+                    else:
+                        api_url = None
+
+                    if api_url:
+                        params = {
+                            "key": publishable_key,
+                            "client_secret": client_secret,
+                            "is_stripe_sdk": "true"
+                        }
+                        api_url = f"{api_url}?{urllib.parse.urlencode(params)}"
+                        api_res = session.get(api_url, headers=headers, timeout_seconds=10)
+                        if api_res.status_code == 200:
+                            res_data = api_res.json()
+                            status = res_data.get("status")
+                            print(f"[Stripe Query] Intent status for {url}: {status}")
+                            return status == "succeeded"
+            except Exception as payload_err:
+                print(f"[-] Failed payload decode: {payload_err}")
+
     except Exception as err:
         print(f"[-] Error verifying stripe payment status: {err}")
-        
+
     return False
 
 # --- DISCORD APPROVAL VIEW ---
@@ -957,9 +1002,8 @@ async def handle_panel_claim(interaction: discord.Interaction, panel_id: int):
         description=(
             f"**Instructions**:\n"
             f"1. Open each Stripe payment link below or scan the QRs to complete the payments.\n"
-            f"2. Once payment is completed, click **Scanned** below each QR code to verify it.\n\n"
-            f"**Warning**: You have 5 minutes to complete this job. If you go offline or exceed 5 minutes, 20 coins will be deducted.\n"
-            f"**Strict Warning**: If you click **Scanned** on a QR that is NOT scanned or completed, **35 coins will be deducted** from your balance."
+            f"2. Payments are automatically verified in real-time via continuous background checking!\n"
+            f"3. Coins will be credited automatically as soon as payment is completed."
         ),
         color=discord.Color.purple()
     )
@@ -969,23 +1013,20 @@ async def handle_panel_claim(interaction: discord.Interaction, panel_id: int):
     
     await private_channel.send(embed=embed, view=view)
 
-    # Send each QR image with its Stripe link and its own Scanned button
+    # Send each QR image with its Stripe link (Auto-verified continuously)
     for idx, job in enumerate(jobs):
         job_embed = discord.Embed(
             title=f"QR #{idx+1} (Job ID: {job['job_id']})",
-            description=f"**Stripe Link**:\n{job['stripe_url']}",
+            description=f"**Stripe Link**:\n{job['stripe_url']}\n\n*⌛ Auto-checking payment status in background...*",
             color=discord.Color.purple()
         )
-        
-        job_view = discord.ui.View(timeout=None)
-        job_view.add_item(discord.ui.Button(label="Scanned", style=discord.ButtonStyle.success, custom_id=f"scanned_job_{job['job_id']}"))
         
         if job["qr_file_path"] and os.path.exists(job["qr_file_path"]) and os.path.getsize(job["qr_file_path"]) > 0:
             qr_file = discord.File(job["qr_file_path"], filename=f"qr_{idx+1}.png")
             job_embed.set_image(url=f"attachment://qr_{idx+1}.png")
-            await private_channel.send(file=qr_file, embed=job_embed, view=job_view)
+            await private_channel.send(file=qr_file, embed=job_embed)
         else:
-            await private_channel.send(embed=job_embed, view=job_view)
+            await private_channel.send(embed=job_embed)
 
     # Edit original Job Panel Card to show claimed status (stays claimed, never marked success/fail on panel board)
     try:
@@ -1163,7 +1204,7 @@ async def finalize_job_success(job_id: int, worker_id: int, message_obj: discord
 
     return True
 
-@tasks.loop(seconds=5)
+@tasks.loop(seconds=3)
 async def auto_verify_stripe_jobs():
     with sqlite3.connect("sparky.db") as db:
         db.row_factory = sqlite3.Row
